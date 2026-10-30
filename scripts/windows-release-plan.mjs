@@ -1,6 +1,6 @@
 import {readFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
-let release=false, version='v0.2.0-alpha.3';
+let release=false, version='v0.2.0-alpha.4';
 const event=process.env.EVENT_NAME||'',ref=process.env.GITHUB_REF||'';
 if(event==='push'&&ref.startsWith('refs/tags/v0.2.')){version=ref.slice('refs/tags/'.length);release=true;}
 else if(event==='push'&&ref==='refs/heads/main'){
@@ -9,7 +9,7 @@ else if(event==='push'&&ref==='refs/heads/main'){
   const changed=execFileSync('git',['diff','--name-only',before,process.env.GITHUB_SHA],{encoding:'utf8'}).trim().split('\n');
   if(changed.includes('.github/windows-release-request.json')){
    const request=JSON.parse(readFileSync('.github/windows-release-request.json','utf8'));
-   if(request.version!=='v0.2.0-alpha.3'||request.release!==true)throw Error('Only approved lightweight Windows prerelease is supported');
+   if(request.version!=='v0.2.0-alpha.4'||request.release!==true)throw Error('Only approved lightweight Windows prerelease is supported');
    version=request.version;release=true;
   }
  }
