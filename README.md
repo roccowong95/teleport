@@ -8,7 +8,7 @@ Send text from your phone's browser/keyboard to the focused input on your comput
 
 - `apps/web`: mobile-first web UI / installable manifest (no offline message queue or service-worker caching of keys).
 - `apps/relay`: Cloudflare Worker + hibernating SQLite Durable Object. Routes opaque encrypted messages only while both ends are online.
-- `apps/desktop`: Electron tray receiver, macOS Swift input helper, dry-run and experimental tmux adapters.
+- `apps/desktop`: Electron tray receiver, macOS Objective-C input helper, dry-run and experimental tmux adapters.
 - `packages/protocol`: shared NaCl encryption, authenticated routing context, pairing codec, replay/expiry gate.
 
 ## Local cloud-runtime development — no Cloudflare login
@@ -25,7 +25,7 @@ npm run dev
 
 `wrangler dev --local` simulates Worker/DO locally. It creates local development state, not a deployed Cloudflare service. Desktop developer instructions: [apps/desktop/README.md](apps/desktop/README.md). Phone Web/PWA details: [apps/web/README.md](apps/web/README.md).
 
-For a headless build/test machine that does not run Electron, use `ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci`. `npm run build` builds the web assets, checks desktop JavaScript syntax, then runs a Worker deployment **dry-run**. It does not compile the Swift helper, package/sign Electron or deploy remotely.
+For a headless build/test machine that does not run Electron, use `ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci`. `npm run build` builds the web assets, checks desktop JavaScript syntax, then runs a Worker deployment **dry-run**. It does not compile the native helper, package/sign Electron or deploy remotely.
 
 Browser acceptance needs Playwright Chromium (`npx playwright install chromium`) and a sandbox capable of running it. `npm run test:browser` runs UI mocks. To test the full UI against the local Worker, run `npm run dev` first, then `npm run test:e2e`. Set `CHROMIUM_PATH` to an existing Chrome/Chromium executable for either browser suite when you do not want a separate Playwright browser download. The latter uses an explicitly simulated input adapter and must not be described as a real OS typing test.
 

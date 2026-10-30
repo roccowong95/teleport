@@ -13,7 +13,7 @@ npm run build -w @teleport/desktop
 npm run headless -w @teleport/desktop -- --endpoint http://localhost:8787 --dry-run
 ```
 
-`build` is JavaScript syntax validation, **not** a signed application build or a native Swift compilation. The dry-run adapter validates protocol plumbing without typing anywhere. Its `injected` ACK is a simulated acceptance, not OS input. The headless CLI holds keys in RAM, prints only its private short-lived pairing URL and security/status information, requires manual SAS approval and `resume`, and best-effort deletes its temporary room on clean exit. Restart requires re-pairing. It never prints received text. Do not use a shared terminal for pairing URLs.
+`build` is JavaScript syntax validation, **not** a signed application build or a native Objective-C compilation. The dry-run adapter validates protocol plumbing without typing anywhere. Its `injected` ACK is a simulated acceptance, not OS input. The headless CLI holds keys in RAM, prints only its private short-lived pairing URL and security/status information, requires manual SAS approval and `resume`, and best-effort deletes its temporary room on clean exit. Restart requires re-pairing. It never prints received text. Do not use a shared terminal for pairing URLs.
 
 ## macOS development (not verified in this Linux cloud environment)
 
@@ -23,9 +23,9 @@ npm run build:mac-helper -w @teleport/desktop
 npm start -w @teleport/desktop
 ```
 
-Enable Accessibility access for the helper/hosting development app in macOS System Settings → Privacy & Security → Accessibility. No permissions are silently granted. Native source requires AppKit/ApplicationServices. GUI/tray launch, Swift compilation, permission prompts, emoji/long-text injection, focus switching, and password rejection still need real-Mac verification. No signed/notarized distributable is provided.
+Enable Accessibility access for the helper/hosting development app in macOS System Settings → Privacy & Security → Accessibility. No permissions are silently granted. Native source uses Objective-C with AppKit/ApplicationServices via the selected xcrun clang/SDK. GUI/tray launch, native compilation, permission prompts, emoji/long-text injection, focus switching, and password rejection still need real-Mac verification. No signed/notarized distributable is provided.
 
-The Swift helper reads UTF-8 via stdin, checks a frontmost enabled AX text field/text area with writable selected text, rejects secure-text subroles, and rechecks the PID and focused AX element before every small Unicode CGEvent chunk. It refuses unsupported/non-AX targets. Large text is split without splitting UTF-16 surrogate pairs. Input begins paused on each launch; resume and then focus the target app before sending. No Return key event is synthesized; newline/tab characters already in the payload remain literal Unicode input and may be interpreted by the target app.
+The Objective-C helper reads UTF-8 via stdin, checks a frontmost enabled AX text field/text area with writable selected text, rejects secure-text subroles, and rechecks the PID and focused AX element before every small Unicode CGEvent chunk. It refuses unsupported/non-AX targets. Large text is split without splitting UTF-16 surrogate pairs. Input begins paused on each launch; resume and then focus the target app before sending. No Return key event is synthesized; newline/tab characters already in the payload remain literal Unicode input and may be interpreted by the target app.
 
 A race between final focus check and OS event delivery is unavoidable with global CGEvent posting. A posted event is not proof that an application accepted or saved text. Partial failure is acknowledged as `unknown`, never automatically retried. Apple notes that some frameworks ignore Unicode event strings: [CGEvent Unicode API](https://developer.apple.com/documentation/coregraphics/cgevent/keyboardsetunicodestring(stringlength:unicodestring:)). Test your target application with harmless text first.
 
@@ -49,3 +49,5 @@ Tests cover explicit-approval pinning, encrypted text/ACK flow, paused-by-defaul
 The desktop device list supports individual revocation. **Delete room & reset** uses a native confirmation dialog, deletes the relay room, then wipes saved identity/pins and returns to paused setup. It requires relay reachability, so deletion failure leaves local credentials intact for retry. Reconnect uses capped exponential delay (1–30 seconds); an explicit restart clears stopped state and generates a fresh session.
 
 **Disconnect** (window or tray menu) closes the WebSocket and cancels reconnect attempts without deleting pairings. **Connect to relay** explicitly reconnects with a fresh session. This is distinct from Pause, which keeps the connection online but rejects text.
+
+The active helper source is `native/TeleportInput.m`; the former Swift source is retained only for reference and is not built. This avoids a Swift-module toolchain failure observed even on a minimal AppKit import, without modifying system SDK files. `native/teleport-input --check-access` reports `access_available` or `access_required` and does not request/change permissions. Exit success here is not a focus/input acceptance test.

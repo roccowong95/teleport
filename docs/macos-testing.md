@@ -26,7 +26,7 @@ After required authorization, dependencies can be installed normally with `npm c
 1. `npm run check`, `npm run build -w @teleport/web`, `npm test`.
 2. `npm run dev`: local loopback Worker/DO only, no Cloudflare login/deployment. Loopback/network permission may be needed in a managed shell.
 3. `npx playwright install chromium`, `npm run test:browser`, then `CHROMIUM_PATH="/path/to/existing/Chrome/executable" npm run test:e2e` (or omit the variable for installed Playwright Chromium). Browser runners require a functioning browser sandbox; do not disable it. E2E uses a dry-run adapter and generated fixture keys, and deletes its room on cleanup.
-4. `npm run build:mac-helper -w @teleport/desktop`: compiles the native source, does not grant Accessibility permission.
+4. `npm run build:mac-helper -w @teleport/desktop`: compiles the active Objective-C source via xcrun clang and matching SDK, does not grant Accessibility permission.
 5. `npm start -w @teleport/desktop`: user explicitly grants required Accessibility access if prompted. Start paused, pair with SAS comparison, then resume only after opening a harmless dedicated editable field. Test Chinese, emoji, multiline, selection replacement, pause, disconnect, secure-field refusal and deliberate focus change. Record exact OS, architecture and target application. Never use a production command line for this.
 
 For protocol-only isolated testing: `npm run headless -w @teleport/desktop -- --endpoint http://localhost:8787 --dry-run`. This receiver holds keys in RAM only; clean exit best-effort deletes its temporary room. Its printed pairing URL is sensitive until expiry; do not publish test logs containing it.
@@ -36,3 +36,7 @@ Desktop GUI uses normal Electron userData by default. For a clean test, supply a
 ## Current platform boundary
 
 macOS native code is the only implemented desktop insertion adapter and remains unverified until these checks pass. Windows currently refuses insertion; no Windows support claim. Linux tmux is an explicitly selected pane, single-line literal WIP. No signed/notarized distribution or automatic CI/deploy workflow is configured.
+
+## Objective-C helper route
+
+The active native helper now uses Objective-C. A minimal Objective-C AppKit import compiled on the test Mac where minimal Swift AppKit import failed. The implementation preserves per-chunk AX/PID/focus checks, rejects secure or unknown-subrole fields, enforces UTF-8 byte/control bounds and checks input-post permission without requesting it. A successful ObjC smoke compile does not prove the full helper or real input works; compile the published implementation and check `apps/desktop/native/teleport-input --check-access` before any harmless-field test. Do not edit system module maps.
