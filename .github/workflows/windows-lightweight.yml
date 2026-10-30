@@ -1,0 +1,133 @@
+name: Lightweight Windows preview
+on:
+  push:
+    branches: [main]
+    tags: ['v0.2.*']
+    paths:
+      - 'apps/windows-tauri/**'
+      - 'packages/protocol/**'
+      - 'scripts/windows-*'
+      - '.github/workflows/windows-lightweight.yml'
+      - '.github/windows-release-request.json'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    paths:
+      - 'apps/windows-tauri/**'
+      - 'packages/protocol/**'
+      - 'scripts/windows-*'
+      - '.github/workflows/windows-lightweight.yml'
+      - '.github/windows-release-request.json'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: teleport-windows-lightweight-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: node scripts/windows-release-plan.mjs >> "$GITHUB_OUTPUT"
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm audit --audit-level=high
+      - run: npm run check
+      - run: npm test
+      - run: node --test scripts/windows-ci.test.mjs
+      - run: npm run build -w @teleport/windows-tauri
+  windows:
+    needs: [plan, core]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      TELEPORT_VERSION: ${{ needs.plan.outputs.version }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - name: Rust toolchain and target
+        working-directory: apps/windows-tauri/src-tauri
+        run: rustup show
+      - name: Test Windows Rust core
+        working-directory: apps/windows-tauri/src-tauri
+        run: cargo test --locked
+      - name: Build lightweight portable executable
+        run: npm exec --workspace @teleport/windows-tauri -- tauri build --no-bundle
+      - name: Actual executable + system WebView2 smoke
+        run: node scripts/windows-smoke.mjs
+      - name: Portable archive and measured size manifest
+        run: node scripts/windows-package.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Teleport-windows-lightweight-x64
+          path: |
+            artifacts/windows-lightweight/*.zip
+            artifacts/windows-lightweight/*.manifest.json
+          if-no-files-found: error
+          retention-days: 3
+  release:
+    needs: [plan, core, windows]
+    if: needs.plan.outputs.release == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: Teleport-windows-lightweight-x64
+          path: release-assets
+      - name: Immutable Windows-only prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          cd release-assets
+          sha256sum *.zip *.manifest.json > SHA256SUMS.txt
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing replacement.' >&2; exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/tags/* ]] && git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo 'Tag already exists; refusing retarget.' >&2; exit 1
+          fi
+          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight Windows preview" --notes "Windows x64 only, source $GITHUB_SHA. Tauri + system WebView2; no Electron/Node/.NET/fixed WebView2 runtime bundled. WebView2 Evergreen Runtime is a prerequisite and is excluded from reported archive/expanded sizes. Unsigned; no security-policy bypass. CI validates native build and actual executable/WebView startup, not real input/UIPI/password-target acceptance. Mac v0.1 artifacts are unchanged. See manifest for measured sizes and SHA256SUMS.txt."

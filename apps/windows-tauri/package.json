@@ -1,0 +1,19 @@
+{
+  "name": "@teleport/windows-tauri",
+  "version": "0.2.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost --port 1420 --strictPort",
+    "build": "vite build",
+    "check": "node --check src/main.js && node --check src/ui.js && node --check vite.config.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0",
+    "@tauri-apps/cli": "2.12.4"
+  }
+}

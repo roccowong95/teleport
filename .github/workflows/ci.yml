@@ -2,8 +2,20 @@ name: Test, package and prerelease
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v0.1.*']
+    paths-ignore:
+      - 'apps/windows-tauri/**'
+      - 'scripts/windows-*'
+      - 'docs/windows-lightweight.md'
+      - '.github/workflows/windows-lightweight.yml'
+      - '.github/windows-release-request.json'
   pull_request:
+    paths-ignore:
+      - 'apps/windows-tauri/**'
+      - 'scripts/windows-*'
+      - 'docs/windows-lightweight.md'
+      - '.github/workflows/windows-lightweight.yml'
+      - '.github/windows-release-request.json'
   workflow_dispatch:
 permissions:
   contents: read

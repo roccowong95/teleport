@@ -1,0 +1,24 @@
+{
+  "note": "Public deterministic test-only keys, NEVER use for pairing.",
+  "senderSecret": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+  "senderPublic": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+  "recipientSecret": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A",
+  "recipientPublic": "ZLEBsdC-WocEvQePmJUAH8A-jp-VIvGI3RKNmEbUhGY",
+  "context": {
+    "roomId": "11111111-2222-4333-8444-555555555555",
+    "sender": "phone",
+    "recipient": "owner"
+  },
+  "payload": {
+    "kind": "text",
+    "text": "你好 👩🏽‍💻\nTeleport",
+    "id": "fixed-test-message"
+  },
+  "plaintext": "{\"v\":1,\"context\":{\"roomId\":\"11111111-2222-4333-8444-555555555555\",\"sender\":\"phone\",\"recipient\":\"owner\"},\"payload\":{\"kind\":\"text\",\"text\":\"你好 👩🏽‍💻\\nTeleport\",\"id\":\"fixed-test-message\"}}",
+  "envelope": {
+    "v": 1,
+    "nonce": "gYKDhIWGh4iJiouMjY6PkJGSk5SVlpeY",
+    "ciphertext": "OCpP3Pp6NwH5boB9o4bX5qC4R9vbbTtilN_hTqhVd0iq4BjOTh1LmswAag_MdbO_pxmhGIe2vfOfhD77IPoSPM5RVnWEH47vcw1EoHYXm7vKtZjY2SZ--MZFpTNkQLqUs4tT3Lcj91UdZMiDflVn83iTe1SKMnLM-RCwnBdrDpkxNCL6jtT16AJlDXc0SM3M35-UBUPZ-83zG0bdO5EZWGJmLoeONrYQF2CF7umJqvXwlAdR4k0AtztXdLz0tzEE5ADniu_2XdAEFnuHbwFIRM--HWhByA"
+  },
+  "sas": "302E-8997-2734"
+}

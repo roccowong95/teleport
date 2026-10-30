@@ -1,0 +1,1 @@
+{"identifier":"main","description":"Local packaged Teleport window only","windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten"]}

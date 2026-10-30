@@ -16,3 +16,10 @@ apps/desktop/native/teleport-input
 apps/desktop/native/windows/
 apps/desktop/native/obj/
 apps/desktop/native/bin/
+
+# Windows native build output
+apps/windows-tauri/src-tauri/target/
+apps/windows-tauri/src-tauri/gen/
+apps/windows-tauri/dist/
+
+apps/windows-tauri/src-tauri/icons/icon.ico
