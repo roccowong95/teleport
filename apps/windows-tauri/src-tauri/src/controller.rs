@@ -25,6 +25,36 @@ fn normalize_endpoint(value: &str) -> Result<String, String> {
     }
     Ok(url.origin().ascii_serialization())
 }
+// Classify without exposing request URLs, headers, tokens or remote response bodies.
+fn http_error(error:&reqwest::Error) -> &'static str {
+    if error.is_timeout() { return "relay_timeout"; }
+    if error.is_builder() { return "relay_request_invalid"; }
+    if error.is_decode() { return "relay_response_invalid"; }
+    if error.is_connect() {
+        use std::error::Error;
+        let mut source=error.source();
+        while let Some(cause)=source {
+            let message=cause.to_string().to_ascii_lowercase();
+            if message.contains("certificate") || message.contains("tls") || message.contains("ssl") { return "relay_tls_failed"; }
+            if message.contains("dns") || message.contains("resolve") || message.contains("name or service") { return "relay_dns_failed"; }
+            if message.contains("proxy") || message.contains("tunnel") { return "relay_proxy_failed"; }
+            source=cause.source();
+        }
+        return "relay_connect_failed";
+    }
+    "relay_unreachable"
+}
+fn websocket_error(error:tokio_tungstenite::tungstenite::Error)->String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Tls(_)=>"relay_tls_failed".into(),
+        Error::Http(response)=>format!("relay_websocket_http_{}",response.status().as_u16()),
+        Error::Io(error) if error.kind()==std::io::ErrorKind::TimedOut=>"relay_timeout".into(),
+        Error::Io(_)=>"relay_connect_failed".into(),
+        _=>"relay_websocket_failed".into(),
+    }
+}
+
 fn validate_state(state: &Value) -> Result<(), String> {
     normalize_endpoint(string(state, "endpoint")?)?;
     Uuid::parse_str(string(state, "roomId")?).map_err(|_| "invalid_room")?;
@@ -108,7 +138,7 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
 }
 
 struct Pending { public_key: String, name: String, expires: u64, confirmed: bool }
-enum Event { Frame(u64, Value), Closed(u64), Injected { generation: u64, device_id: String, message_id: String, success: bool, token: Arc<AtomicBool> } }
+enum Event { Frame(u64, Value), Closed(u64, Option<String>), Injected { generation: u64, device_id: String, message_id: String, success: bool, token: Arc<AtomicBool> } }
 struct Actor {
     safety: Arc<Safety>,
     path: PathBuf, emit: Emit, state: Option<Value>, http: reqwest::Client,
@@ -134,7 +164,10 @@ impl Actor {
                         Event::Frame(generation, message) if generation == self.generation => {
                             if self.receive(message).await.is_err() { (self.emit)("notice", json!("Message refused or connection error.")); }
                         }
-                        Event::Closed(generation) if generation == self.generation => self.disconnected(),
+                        Event::Closed(generation,error) if generation == self.generation => {
+                            self.disconnected();
+                            if let Some(code)=error { (self.emit)("notice",json!(code)); }
+                        },
                         Event::Injected {generation, device_id, message_id, success, token} => {
                             self.safety.finish(&token);
                             let success=success && !token.load(Ordering::Acquire);
@@ -181,9 +214,9 @@ impl Actor {
         let (outbound, rx) = mpsc::channel(16); self.outbound = Some(outbound);
         let events = self.events.clone(); let generation = self.generation; let safety=self.safety.clone();
         self.transport = Some(tokio::spawn(async move {
-            let _ = transport(url.to_string(), token, generation, rx, events.clone(),safety.clone()).await;
+            let error = transport(url.to_string(), token, generation, rx, events.clone(),safety.clone()).await.err();
             safety.cancel_transport(generation);
-            let _ = events.send(Event::Closed(generation)).await;
+            let _ = events.send(Event::Closed(generation,error)).await;
         }));
         self.changed();
     }
@@ -215,7 +248,7 @@ impl Actor {
         let url = format!("{}/api/rooms{}",string(state,"endpoint")?,suffix);
         let mut request = self.http.request(method,url).bearer_auth(string(state,"ownerToken")?);
         if let Some(body) = body { request = request.json(&body); }
-        let mut response = request.send().await.map_err(|_| "relay_unreachable")?;
+        let mut response = request.send().await.map_err(|error| http_error(&error))?;
         if !response.status().is_success() { return Err(format!("relay_http_{}",response.status().as_u16())); }
         if response.status().as_u16() == 204 { return Ok(json!({})); }
         let mut bytes = Vec::new();
@@ -401,7 +434,7 @@ async fn transport(url: String, token: String, generation: u64, mut outbound: mp
         .max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME));
     let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10),
         tokio_tungstenite::connect_async_with_config(&url,Some(config),false)).await
-        .map_err(|_| "connect_timeout")?.map_err(|_| "connect_failed")?;
+        .map_err(|_| "relay_timeout")?.map_err(websocket_error)?;
     socket.send(Message::Text(json!({"type":"auth","role":"owner","token":token}).to_string().into())).await.map_err(|_| "auth_failed")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     // Authentication must precede all control and application events.
@@ -605,6 +638,52 @@ mod tests {
         let token=safety.begin().unwrap(); safety.cancel_transport(1);
         assert!(!token.load(Ordering::Acquire)); assert!(!safety.emergency.load(Ordering::SeqCst));
         safety.cancel_transport(2); assert!(token.load(Ordering::Acquire)); assert!(safety.emergency.load(Ordering::SeqCst));
+    }
+
+    /// Opt-in live diagnostic: synthetic room only; always attempts room deletion.
+    /// TELEPORT_TEST_RELAY must be an explicitly authorized deployed relay origin.
+    #[tokio::test]
+    #[ignore = "requires explicit TELEPORT_TEST_RELAY network authorization"]
+    async fn native_live_http_websocket_auth_and_cleanup() {
+        let endpoint=std::env::var("TELEPORT_TEST_RELAY").expect("set TELEPORT_TEST_RELAY");
+        let endpoint=normalize_endpoint(&endpoint).unwrap();
+        let (mut actor,_,_,_)=actor_fixture();
+        actor.http=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(10)).build().unwrap();
+        let mut state=actor.state().unwrap().clone(); state["endpoint"]=json!(endpoint);
+        let response=actor.request_for(&state,"",reqwest::Method::POST,Some(json!({"ownerToken":state["ownerToken"],"ownerPublicKey":state["publicKey"],"name":"Windows native diagnostic"}))).await;
+        let response=response.expect("native Rust room creation failed (sanitized code)");
+        let room=string(&response,"roomId").expect("missing roomId");
+        let mut url=reqwest::Url::parse(&format!("{endpoint}/api/rooms/{room}/ws")).unwrap();
+        let scheme=if url.scheme()=="https" {"wss"} else {"ws"}; url.set_scheme(scheme).unwrap();
+        let (events,mut event_rx)=mpsc::channel(4); let (_outbound,rx)=mpsc::channel(4);
+        let safety=Arc::new(Safety::new()); safety.transport.store(1,Ordering::SeqCst);
+        let token=string(&state,"ownerToken").unwrap().to_owned();
+        let task=tokio::spawn(async move {
+            let error=transport(url.to_string(),token,1,rx,events.clone(),safety).await.err();
+            let _=events.send(Event::Closed(1,error)).await;
+        });
+        let authentication=tokio::time::timeout(Duration::from_secs(22),event_rx.recv()).await;
+        task.abort();
+        // Cleanup runs before assertions, including failed upgrade/authentication.
+        let deletion=actor.request_for(&state,&format!("/{room}"),reqwest::Method::DELETE,None).await;
+        assert!(deletion.is_ok(),"synthetic room cleanup failed: {:?}",deletion.err());
+        assert!(Uuid::parse_str(room).is_ok());
+        match authentication {
+            Ok(Some(Event::Frame(_,message)))=>assert_eq!(message["type"],"authenticated"),
+            Ok(Some(Event::Closed(_,code)))=>panic!("native WebSocket failed (sanitized code): {code:?}"),
+            _=>panic!("native WebSocket authentication timed out; room cleanup completed"),
+        }
+    }
+
+    #[test] fn transport_diagnostics_are_sanitized_and_actionable() {
+        let error=reqwest::Client::new().get("http://[invalid/private-secret-token").build().unwrap_err();
+        assert_eq!(http_error(&error),"relay_request_invalid");
+        let timeout=tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut,"private-secret-token"));
+        assert_eq!(websocket_error(timeout),"relay_timeout");
+        let connect=tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused,"private-secret-token"));
+        assert_eq!(websocket_error(connect),"relay_connect_failed");
+        let response=tokio_tungstenite::tungstenite::http::Response::builder().status(403).body(Some(b"private-secret-token".to_vec())).unwrap();
+        assert_eq!(websocket_error(tokio_tungstenite::tungstenite::Error::Http(Box::new(response))),"relay_websocket_http_403");
     }
 
 }

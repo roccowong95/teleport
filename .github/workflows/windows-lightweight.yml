@@ -87,6 +87,12 @@ jobs:
       - name: Test Windows Rust core
         working-directory: apps/windows-tauri/src-tauri
         run: cargo test --locked
+      - name: Authorized synthetic native Rust live relay check
+        if: github.event_name == 'push' && github.repository == 'roccowong95/teleport'
+        working-directory: apps/windows-tauri/src-tauri
+        env:
+          TELEPORT_TEST_RELAY: https://teleport-relay.roccowang95.workers.dev
+        run: cargo test --locked native_live_http_websocket_auth_and_cleanup -- --ignored --nocapture
       - name: Build lightweight portable executable
         run: npm exec --workspace @teleport/windows-tauri -- tauri build --no-bundle
       - name: Actual executable + system WebView2 smoke
@@ -130,4 +136,4 @@ jobs:
           if [[ "$GITHUB_REF" != refs/tags/* ]] && git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" >/dev/null 2>&1; then
             echo 'Tag already exists; refusing retarget.' >&2; exit 1
           fi
-          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight Windows preview" --notes "Windows x64 only, source $GITHUB_SHA. Tauri + system WebView2; no Electron/Node/.NET/fixed WebView2 runtime bundled. WebView2 Evergreen Runtime is a prerequisite and is excluded from reported archive/expanded sizes. Unsigned; no security-policy bypass. CI validates native build and actual executable/WebView startup, not real input/UIPI/password-target acceptance. Mac v0.1 artifacts are unchanged. See manifest for measured sizes and SHA256SUMS.txt."
+          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight Windows preview" --notes "Windows x64 only, source $GITHUB_SHA. Tauri + system WebView2; no Electron/Node/.NET/fixed WebView2 runtime bundled. WebView2 Evergreen Runtime is a prerequisite and is excluded from reported archive/expanded sizes. Unsigned; no security-policy bypass. Safe stage-specific connection diagnostics added; this does not fix network blocking of workers.dev. CI validates native Rust live HTTP/WebSocket authentication and cleanup, native build and executable/WebView startup, not real input/UIPI/password-target acceptance. Mac v0.1 artifacts are unchanged. See manifest for measured sizes and SHA256SUMS.txt."

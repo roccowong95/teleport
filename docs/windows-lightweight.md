@@ -37,3 +37,11 @@ Only the release job has `contents: write`; no Cloudflare deployment, signing cr
 ## Stop behavior
 
 Pause/disconnect/revoke/reset signal the active native operation before waiting for the controller/network. New text is blocked while that emergency stop is pending. Each native Unicode chunk and its immediate `SendInput` boundary checks the per-operation cancellation flag. Cancellation is reported as unknown, never retried. Windows input events already posted cannot be recalled; focus/cancellation checks and event posting cannot form an atomic OS transaction. This is not a hard real-time emergency-stop guarantee.
+
+### alpha.2 connection diagnostics
+
+Setup and later status refresh failures now report separate stages and reviewed error codes. Raw errors, URLs, local paths and credentials are not displayed. HTTP timeout/connect/TLS failures and WebSocket upgrade failures are distinct; a diagnostic category is not proof of the user's network root cause. This release does **not** make blocked or unreachable `workers.dev` domains reachable.
+
+Current proxy boundary: HTTP reads inherited proxy environment variables; it does not currently import Windows Internet Settings/PAC. WebSocket connections are direct and do not automatically use proxy environment variables or Windows proxy settings. Browser reachability therefore does not prove backend reachability. TLS verification remains strict.
+
+An explicitly opted-in Windows CI check creates a synthetic room, uses the production Rust HTTP and WebSocket transport, verifies authentication and deletes the room. It does not use native input or real user text. Ordinary unit tests skip this live test; no Cloudflare account credential is required.
