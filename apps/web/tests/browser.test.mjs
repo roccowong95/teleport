@@ -2,7 +2,6 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from '@playwright/test';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { generateIdentity, randomToken, seal, open, encodePairing } from '@teleport/protocol';
 const origin = 'http://localhost:5187';
 const roomId = 'e4e44654-d9ce-42a5-94d9-f80af6f4d157';
@@ -13,7 +12,7 @@ let server, browser;
 before(async()=>{
  server=spawn(process.execPath, ['../../node_modules/vite/bin/vite.js','--host','localhost','--port','5187','--strictPort'], {cwd:new URL('..',import.meta.url),stdio:'ignore'});
  for(let i=0;i<80;i++){try{if((await fetch(origin)).ok)break;}catch{} await new Promise(r=>setTimeout(r,100));}
- browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH || (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined),chromiumSandbox:true});
+ browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH || undefined,chromiumSandbox:true});
 });
 after(async()=>{await browser?.close();server?.kill();});
 async function setup({ready=true}={}){

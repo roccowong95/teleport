@@ -50,22 +50,6 @@ jobs:
       - run: npm run build
         env:
           WRANGLER_SEND_METRICS: 'false'
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:browser
-      - name: Actual browser, local Worker/DO, simulated receiver
-        shell: bash
-        env:
-          WRANGLER_SEND_METRICS: 'false'
-        run: |
-          npm run dev -w @teleport/relay -- --ip 127.0.0.1 --port 8787 > /tmp/teleport-relay.log 2>&1 &
-          server=$!
-          trap 'kill "$server" 2>/dev/null || true' EXIT
-          for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8787/ >/dev/null; then break; fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:8787/ >/dev/null
-          npm run test:e2e
   desktop:
     needs: [plan, core]
     strategy:
@@ -104,8 +88,29 @@ jobs:
         if: runner.os == 'macOS'
       - run: npm run build:windows-helper -w @teleport/desktop
         if: runner.os == 'Windows'
+      - run: npm run build -w @teleport/web
+        if: runner.os == 'macOS'
+      - run: npx playwright install chromium
+        if: runner.os == 'macOS'
+      - run: npm run test:browser
+        if: runner.os == 'macOS'
+      - name: Sandboxed browser, local Worker/DO, simulated receiver
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          npm run dev -w @teleport/relay -- --ip 127.0.0.1 --port 8787 > /tmp/teleport-relay.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/ >/dev/null
+          npm run test:e2e
       - run: npm run package:desktop
-      - name: Archive macOS unsigned app
+      - name: Archive macOS ad-hoc sealed app
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent artifacts/desktop/Teleport-darwin-arm64/Teleport.app artifacts/Teleport-macos-arm64.zip
       - name: Archive Windows unsigned portable app
@@ -150,4 +155,4 @@ jobs:
             echo 'Tag already exists; refusing to retarget.' >&2
             exit 1
           fi
-          gh release create "$VERSION" ./*.zip SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION (unsigned preview)" --notes "Built from $GITHUB_SHA after all CI checks. macOS arm64 and Windows x64 previews are unsigned and macOS is not notarized. Build/tests do not grant Accessibility permissions or establish real focused-input acceptance. No Cloudflare deployment, signing credentials or automatic update channel. Verify SHA256SUMS.txt before manual testing."
+          gh release create "$VERSION" ./*.zip SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION (preview: no Developer ID)" --notes "Built from $GITHUB_SHA after all CI checks. macOS arm64 is ad-hoc sealed, not Developer ID signed or notarized; Windows x64 is unsigned. Build/tests do not grant Accessibility permissions or establish real focused-input acceptance. No Cloudflare deployment, signing credentials or automatic update channel. Verify SHA256SUMS.txt before manual testing."
