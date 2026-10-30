@@ -110,6 +110,9 @@ jobs:
           curl -fsS http://127.0.0.1:8787/ >/dev/null
           npm run test:e2e
       - run: npm run package:desktop
+      - name: Smoke actual packaged macOS GUI
+        if: runner.os == 'macOS'
+        run: node scripts/smoke-packaged-mac.mjs
       - name: Archive macOS ad-hoc sealed app
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent artifacts/desktop/Teleport-darwin-arm64/Teleport.app artifacts/Teleport-macos-arm64.zip

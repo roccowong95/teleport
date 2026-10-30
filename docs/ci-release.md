@@ -31,3 +31,9 @@ Only native macOS arm64 / Windows x64 packaging is defined. The script deliberat
 ## macOS ad-hoc integrity seal
 
 The standard `@electron/osx-sign` path signs nested code from the inside out with identity `-`, not a Developer ID certificate. It keeps the library’s Electron-specific per-helper hardened-runtime/JIT entitlement defaults, disables timestamp service (`none`), fails packaging if signing fails, and does not use a blanket `codesign --deep` command. No signing credential or notarization service is involved. This seal does not establish developer trust and does not bypass Gatekeeper, quarantine or Accessibility authorization.
+
+## Packaged GUI startup gate
+
+After packaging, macOS CI launches the actual app executable with a dedicated temporary profile. It requires main-process readiness, sandboxed renderer readiness and clean exit within 60 seconds. It makes no relay connection or real input request and does not alter Keychain, Accessibility, quarantine or host security settings. This gate catches pre-JavaScript loader/signature failures that source-level tests cannot.
+
+For ad-hoc macOS previews only, the main and Electron helper app-bundle signatures add `com.apple.security.cs.disable-library-validation` to their role-specific standard Electron entitlement plists. Ad-hoc binaries have no Team ID, so default hardened-runtime library validation otherwise rejects the embedded Electron Framework. Hardened runtime and JIT settings remain; the narrow exception is not applied to the native input helper. This reduces that app's library-validation protection and is an explicit development-distribution limitation, not an OS policy bypass or notarization substitute. A future Developer ID release should reassess/remove the exception with proper same-team signing.

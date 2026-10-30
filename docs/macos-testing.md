@@ -40,3 +40,9 @@ macOS native code is the only implemented desktop insertion adapter and remains 
 ## Objective-C helper route
 
 The active native helper now uses Objective-C. A minimal Objective-C AppKit import compiled on the test Mac where minimal Swift AppKit import failed. The implementation preserves per-chunk AX/PID/focus checks, rejects secure or unknown-subrole fields, enforces UTF-8 byte/control bounds and checks input-post permission without requesting it. A successful ObjC smoke compile does not prove the full helper or real input works; compile the published implementation and check `apps/desktop/native/teleport-input --check-access` before any harmless-field test. Do not edit system module maps.
+
+### Packaged startup regression (alpha.2)
+
+The alpha.1 artifact passed compilation and archive-integrity checks but failed before JavaScript startup: macOS dyld library validation rejected its ad-hoc Electron Framework. Alpha.2 adds a packaged-app launch gate, not merely a signature verification. It starts the actual app executable with an isolated temporary profile, loads the sandboxed renderer and preload, verifies the restricted status IPC, and exits. This smoke check does not call Accessibility, read real identities, connect a relay, or prove focused native input.
+
+The development build remains ad-hoc signed, not Developer ID signed/notarized. Its Electron app/helper bundle entitlements allow loading the bundled ad-hoc libraries; OS security settings and quarantine are not changed. Production distribution needs a separately authorized signing/notarization design.
