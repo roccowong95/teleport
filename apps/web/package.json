@@ -1,0 +1,20 @@
+{
+  "name": "@teleport/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/security.test.mjs",
+    "test:browser": "node --test tests/browser.test.mjs"
+  },
+  "dependencies": {
+    "@teleport/protocol": "*"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0",
+    "typescript": "^5.7.3"
+  }
+}

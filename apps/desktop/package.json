@@ -1,0 +1,23 @@
+{
+  "name": "@teleport/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "build": "node --check src/main.cjs && node --check src/controller.mjs && node --check src/adapters.mjs && node --check src/renderer.js && node --check src/headless.mjs && node --check src/store.mjs && node --check src/preload.cjs",
+    "check": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "build:mac-helper": "swiftc native/TeleportInput.swift -o native/teleport-input -framework AppKit -framework ApplicationServices",
+    "headless": "node src/headless.mjs"
+  },
+  "dependencies": {
+    "@teleport/protocol": "0.1.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^41.0.0"
+  }
+}
