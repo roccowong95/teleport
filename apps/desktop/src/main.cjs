@@ -1,8 +1,13 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, safeStorage, dialog } = require('electron');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+const { isTrustedSender } = require('./ipc-guard.cjs');
 let window, tray, receiver;
-function show() { window.show(); window.focus(); }
-app.whenReady().then(async () => {
+function show() { if (window && !window.isDestroyed()) { window.show(); window.focus(); } }
+app.on('second-instance', show);
+const ownsInstance = app.requestSingleInstanceLock();
+if (!ownsInstance) app.quit();
+else app.whenReady().then(async () => {
   const { Receiver } = await import('./controller.mjs');
   const { EncryptedStore } = await import('./store.mjs');
   const { MacAdapter, DryRunAdapter, UnsupportedAdapter } = await import('./adapters.mjs');
@@ -20,15 +25,20 @@ app.whenReady().then(async () => {
   receiver.on('status', state => { window.webContents.send('status',state); updateMenu(); });
   receiver.on('notice', message => window.webContents.send('notice',message));
   receiver.on('pair-request', request => { show(); window.webContents.send('pair-request',request); });
-  // Narrow trusted renderer API. No filesystem, arbitrary IPC, or shell access.
-  ipcMain.handle('status', () => receiver.status());
-  ipcMain.handle('setup', (_, value) => receiver.setup(value.endpoint,value.name));
-  ipcMain.handle('pairing', async () => { const result = await receiver.pairing(); return {...result, qr:await QRCode.toDataURL(result.url)}; });
-  ipcMain.handle('approve', (_, id, confirmed) => receiver.approve(String(id),confirmed === true));
-  ipcMain.handle('connection', (_, connected) => { if (connected === true) receiver.connect(); else receiver.stop(); });
-  ipcMain.handle('pause', (_, paused) => receiver.pause(paused === true));
-  ipcMain.handle('revoke', (_, id) => receiver.revoke(String(id)));
-  ipcMain.handle('reset', async () => { const result = await dialog.showMessageBox(window, {type:'warning',buttons:['Cancel','Delete room and reset'],defaultId:0,cancelId:0,message:'Delete this room and all paired phones?',detail:'This removes this computer’s saved identity. You must pair again after setup.'}); if (result.response === 1) await receiver.reset(); });
+  // Narrow trusted renderer API. Reject subframes and all other renderers.
+  const expectedURL = pathToFileURL(path.join(__dirname,'index.html')).href;
+  const handle = (channel, callback) => ipcMain.handle(channel, (event, ...args) => {
+    if (!isTrustedSender(event, window, expectedURL)) throw new Error('Untrusted IPC sender');
+    return callback(event, ...args);
+  });
+  handle('status', () => receiver.status());
+  handle('setup', (_, value) => receiver.setup(value.endpoint,value.name));
+  handle('pairing', async () => { const result = await receiver.pairing(); return {...result, qr:await QRCode.toDataURL(result.url)}; });
+  handle('approve', (_, id, confirmed) => receiver.approve(String(id),confirmed === true));
+  handle('connection', (_, connected) => { if (connected === true) receiver.connect(); else receiver.stop(); });
+  handle('pause', (_, paused) => receiver.pause(paused === true));
+  handle('revoke', (_, id) => receiver.revoke(String(id)));
+  handle('reset', async () => { const result = await dialog.showMessageBox(window, {type:'warning',buttons:['Cancel','Delete room and reset'],defaultId:0,cancelId:0,message:'Delete this room and all paired phones?',detail:'This removes this computer’s saved identity. You must pair again after setup.'}); if (result.response === 1) await receiver.reset(); });
   await window.loadFile(path.join(__dirname,'index.html'));
   try { await receiver.initialize(); if (receiver.state) receiver.connect(); } catch { await dialog.showMessageBox(window,{type:'error',message:'Secure credential storage unavailable or unreadable. Teleport is stopped. Enable your OS keychain and relaunch.'}); app.quit(); return; }
   show();

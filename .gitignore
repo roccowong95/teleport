@@ -8,3 +8,6 @@ artifacts/
 playwright-report/
 test-results/
 .local/
+
+# Native build output
+apps/desktop/native/teleport-input

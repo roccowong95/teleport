@@ -4,7 +4,7 @@
 
 - Shared protocol: 8 tests (Unicode, encryption/authentication, tampering, SAS, pairing expiry, session/TTL/replay gate, low-order key rejection).
 - Relay: 10 tests using actual workerd/Miniflare SQLite Durable Objects and WebSockets (approval, auth, revocation, connection caps, 10-second authentication expiry, reconstructed state, maximum escaped text size, offline no-queue).
-- Desktop controller/adapters: 14 unit tests for pinned keys, explicit approval, pause, injection result/unknown, dedupe, encrypted safeStorage, reset, reconnect and tmux argument safety.
+- Desktop controller/adapters: 17 unit tests for pinned keys, explicit approval, pause, injection result/unknown, dedupe, encrypted safeStorage, reset, reconnect and tmux argument safety.
 - Phone helpers: 3 tests (origin, send guards, reconnect backoff).
 - Cross-component integration: actual DO + actual desktop controller + phone protocol test passed: matching SAS, approval, paused state, encrypted Chinese/emoji/multiline text delivered once to simulated adapter, duplicate rejection, session rotation, revocation.
 - TypeScript/syntax checks and production web build; asset-aware Wrangler deployment dry-run. **No deployed service**.

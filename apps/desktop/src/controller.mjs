@@ -17,7 +17,7 @@ export class Receiver extends EventEmitter {
   changed() { this.emit('status', this.status()); }
   async request(path, body, method = 'POST') {
     const res = await this.fetchImpl(`${this.state.endpoint}/api/rooms${path}`, { method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.state.ownerToken}` }, ...(body ? {body: JSON.stringify(body)} : {}) });
-    if (!res.ok) throw new Error(`relay_http_${res.status}`);
+    if (!res.ok) { const error = new Error(`relay_http_${res.status}`); error.status = res.status; throw error; }
     return res.status === 204 ? {} : res.json();
   }
   async setup(endpoint, name) {
@@ -70,7 +70,8 @@ export class Receiver extends EventEmitter {
     this.send({type:'pair-approve',deviceId});
   }
   async revoke(deviceId) {
-    await this.request(`/${this.state.roomId}/devices/${encodeURIComponent(deviceId)}`, null, 'DELETE');
+    try { await this.request(`/${this.state.roomId}/devices/${encodeURIComponent(deviceId)}`, null, 'DELETE'); }
+    catch (error) { if (error.status !== 404) throw error; } // Definitive absence permits clearing an orphaned local pin.
     delete this.state.peers[deviceId]; this.online.delete(deviceId); await this.store.save(this.state); this.changed();
   }
   async reset() {
@@ -84,7 +85,10 @@ export class Receiver extends EventEmitter {
     switch (message.type) {
       case 'authenticated': this.retryAttempt = 0; this.connected = true; this.changed(); break;
       case 'pair-request': {
-        if (this.state.peers[id]) return;
+        const pinned = this.state.peers[id];
+        if (pinned && pinned.publicKey !== message.publicKey) { this.emit('notice','Changed public key refused. Revoke this device before pairing again.'); return; }
+        // An earlier explicit approval may have been saved locally but lost in transit.
+        // Re-present the same pinned key for human confirmation; never replace it.
         this.pending.set(id, {...message, confirmed:false, expiresAt:this.now()+120000});
         this.emit('pair-request', {deviceId:id,name:message.name,sas:await sas(this.state.secretKey,message.publicKey,this.state.roomId)}); break;
       }
