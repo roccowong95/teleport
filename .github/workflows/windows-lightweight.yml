@@ -5,6 +5,8 @@ on:
     tags: ['v0.2.*']
     paths:
       - 'apps/windows-tauri/**'
+      - 'apps/web/**'
+      - 'tests/e2e.test.mjs'
       - 'packages/protocol/**'
       - 'scripts/windows-*'
       - '.github/workflows/windows-lightweight.yml'
@@ -14,6 +16,8 @@ on:
   pull_request:
     paths:
       - 'apps/windows-tauri/**'
+      - 'apps/web/**'
+      - 'tests/e2e.test.mjs'
       - 'packages/protocol/**'
       - 'scripts/windows-*'
       - '.github/workflows/windows-lightweight.yml'
@@ -63,6 +67,38 @@ jobs:
       - run: npm test
       - run: node --test scripts/windows-ci.test.mjs
       - run: npm run build -w @teleport/windows-tauri
+  phone:
+    needs: core
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm run build -w @teleport/web
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - name: Phone browser through local Worker and simulated input
+        shell: bash
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          npm run dev -w @teleport/relay -- --ip 127.0.0.1 --port 8787 > /tmp/teleport-relay.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/ >/dev/null
+          npm run test:e2e
   windows:
     needs: [plan, core]
     runs-on: windows-latest
@@ -108,7 +144,7 @@ jobs:
           if-no-files-found: error
           retention-days: 3
   release:
-    needs: [plan, core, windows]
+    needs: [plan, core, windows, phone]
     if: needs.plan.outputs.release == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -136,4 +172,4 @@ jobs:
           if [[ "$GITHUB_REF" != refs/tags/* ]] && git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" >/dev/null 2>&1; then
             echo 'Tag already exists; refusing retarget.' >&2; exit 1
           fi
-          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight Windows preview" --notes "Windows x64 only, source $GITHUB_SHA. Tauri + system WebView2; no Electron/Node/.NET/fixed WebView2 runtime bundled. WebView2 Evergreen Runtime is a prerequisite and is excluded from reported archive/expanded sizes. Unsigned; no security-policy bypass. Safe stage-specific connection diagnostics added; this does not fix network blocking of workers.dev. CI validates native Rust live HTTP/WebSocket authentication and cleanup, native build and executable/WebView startup, not real input/UIPI/password-target acceptance. Mac v0.1 artifacts are unchanged. See manifest for measured sizes and SHA256SUMS.txt."
+          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight Windows preview" --notes "Windows x64 only, source $GITHUB_SHA. Tauri + system WebView2; no Electron/Node/.NET/fixed WebView2 runtime bundled. WebView2 Evergreen Runtime is a prerequisite and is excluded from reported archive/expanded sizes. Unsigned; no security-policy bypass. Safe native-input result diagnostics added on desktop and phone; rejected-before-posting is distinct from possible partial/unknown input. No input safety gate was relaxed. CI validates native Rust live HTTP/WebSocket authentication and cleanup, native build and executable/WebView startup, not real input/UIPI/password-target acceptance. Mac v0.1 artifacts are unchanged. See manifest for measured sizes and SHA256SUMS.txt."

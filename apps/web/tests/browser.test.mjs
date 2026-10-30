@@ -1,6 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import { spawn } from 'node:child_process';
 import { generateIdentity, randomToken, seal, open, encodePairing } from '@teleport/protocol';
 const origin = 'http://localhost:5187';
@@ -32,7 +32,7 @@ test('mobile layout and encrypted send preserve draft; Enter never sends; discon
  const payload=open(t.relays[0].envelope,{roomId,sender:deviceId,recipient:'owner'},phone.publicKey,owner.secretKey);
  assert.equal(payload.text,'你好，Teleport\n');assert.equal(payload.sessionId,'session-test');assert.equal(JSON.stringify(t.relays[0]).includes('你好'),false);
  t.wire.send(JSON.stringify(encrypted({kind:'ack',id:payload.id,status:'injected'})));
- await t.page.waitForFunction(()=>document.querySelector('#result').textContent.includes('已输入'));
+ await t.page.waitForFunction(()=>document.querySelector('#result').textContent.includes('电脑已提交输入事件'));
  assert.equal(await t.page.locator('#draft').inputValue(),'你好，Teleport\n');
  await t.page.locator('#connect').click();assert.equal(await t.page.locator('#send').isDisabled(),true);
  await t.page.evaluate(()=>window.dispatchEvent(new Event('online')));await t.page.waitForTimeout(100);assert.match(await t.page.locator('#status').textContent(),/手动断开/);
@@ -77,4 +77,47 @@ test('forget disables sending immediately while server revocation is still pendi
   finish();
   await t.page.waitForFunction(()=>document.querySelector('#device-panel').hidden);
  }finally{finish();await t.context.close();}
+});
+
+test('disabled composer explains empty, oversized, paused, and manual disconnect states without sending',async()=>{
+ const t=await setup();try{
+  assert.match(await t.page.locator('#send-hint').textContent(),/还没有文字/);
+  await t.page.locator('#draft').fill('中'.repeat(3000));assert.equal(await t.page.locator('#send').isDisabled(),true);assert.match(await t.page.locator('#send-hint').textContent(),/8192/);
+  await t.page.locator('#draft').fill('检查微信输入框');
+  t.wire.send(JSON.stringify(encrypted({kind:'ready',sessionId:'session-test',targetLabel:'当前焦点窗口',paused:true})));
+  await t.page.waitForFunction(()=>document.querySelector('#send-hint').textContent.includes('暂停'));
+  assert.equal(await t.page.locator('#send').isDisabled(),true);
+  sendReady(t.wire);await t.page.waitForFunction(()=>!document.querySelector('#send').disabled);
+  await t.page.locator('#connect').click();assert.match(await t.page.locator('#send-hint').textContent(),/重新连接/);
+  assert.equal(t.relays.length,0);assert.equal(await t.page.locator('#draft').inputValue(),'检查微信输入框');
+ }finally{await t.context.close();}
+});
+
+test('rejected and partial ACKs show whitelist diagnostics, retain drafts, and never retry',async()=>{
+ const t=await setup();try{
+  await t.page.locator('#draft').fill('检查微信输入框');
+  for(const [status,code,expected] of [['rejected','paused','电脑已暂停'],['unknown','input_posting_unconfirmed','部分'],['unknown','secret-error-text','结果未知']]) {
+   const count=t.relays.length;await t.page.locator('#send').click();
+   await t.page.waitForFunction(()=>document.querySelector('#result').textContent.includes('本次已发出密文'));
+   assert.match(await t.page.locator('#send').textContent(),/等待电脑确认/);
+   assert.equal(await t.page.locator('#send').isDisabled(),true);
+   await expect.poll(()=>t.relays.length).toBe(count+1);
+   const payload=open(t.relays[count].envelope,{roomId,sender:deviceId,recipient:'owner'},phone.publicKey,owner.secretKey);
+   t.wire.send(JSON.stringify(encrypted({kind:'ack',id:payload.id,status,code})));
+   await t.page.waitForFunction(text=>document.querySelector('#result').textContent.includes(text),expected);
+   assert.doesNotMatch(await t.page.locator('#result').textContent(),/secret-error-text/);
+   assert.equal(await t.page.locator('#draft').inputValue(),'检查微信输入框');
+   await t.page.waitForTimeout(100);assert.equal(t.relays.length,count+1);
+  }
+ }finally{await t.context.close();}
+});
+
+test('ACK timeout shows elapsed limit and unknown result without replay or draft loss',async()=>{
+ const t=await setup();try{
+  await t.page.clock.install();await t.page.locator('#draft').fill('超时仍保留');await t.page.locator('#send').click();
+  await t.page.clock.fastForward(16000);
+  assert.match(await t.page.locator('#result').textContent(),/超过 15 秒.*结果未知/);
+  assert.equal(await t.page.locator('#draft').inputValue(),'超时仍保留');
+  await t.page.clock.fastForward(60000);await expect.poll(()=>t.relays.length).toBe(1);
+ }finally{await t.context.close();}
 });

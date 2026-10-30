@@ -4,16 +4,47 @@
 
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-fn ensure_active(cancel: &AtomicBool) -> Result<(), String> {
-    if cancel.load(Ordering::Acquire) { Err("input_cancelled".into()) } else { Ok(()) }
+/// Only these static codes may cross the native/controller/UI boundary.
+pub const INPUT_FAILURE_CODES: &[&str] = &[
+    "input_size_refused", "input_control_refused", "input_cancelled",
+    "windows_input_unavailable", "input_busy", "input_worker_failed", "input_worker_unavailable",
+    "input_deadline_exceeded", "input_posting_unconfirmed", "input_desktop_unavailable",
+    "input_modifier_held", "input_foreground_unavailable", "input_integrity_unknown", "input_target_elevated",
+    "input_focus_unavailable", "input_focus_pid_mismatch", "input_enabled_unknown", "input_target_disabled",
+    "input_focus_state_unknown", "input_target_not_focused", "input_focusable_unknown", "input_target_not_focusable",
+    "input_password_unknown", "input_password_target", "input_control_type_unknown", "input_unsupported_control",
+    "input_editability_unknown", "input_target_readonly", "input_unsupported_editability",
+    "input_runtime_id_unavailable", "input_focus_changed", "input_automation_unavailable",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputFailure {
+    pub code: &'static str,
+    /// True as soon as SendInput is attempted, including zero/partial event counts.
+    /// Once true, later cancellation/guard failure/panic must remain unknown.
+    pub may_have_posted: bool,
+}
+fn failure(code: &'static str) -> InputFailure {
+    debug_assert!(INPUT_FAILURE_CODES.contains(&code));
+    InputFailure { code, may_have_posted: false }
+}
+#[cfg(any(windows, test))]
+fn with_posting_progress(mut error: InputFailure, posting: &AtomicBool) -> InputFailure {
+    error.may_have_posted |= posting.load(Ordering::Acquire);
+    error
 }
 
-fn validate_text(text: &str) -> Result<(), String> {
+
+fn ensure_active(cancel: &AtomicBool) -> Result<(), InputFailure> {
+    if cancel.load(Ordering::Acquire) { Err(failure("input_cancelled")) } else { Ok(()) }
+}
+
+fn validate_text(text: &str) -> Result<(), InputFailure> {
     if text.is_empty() || text.len() > 8192 {
-        return Err("input_size_refused".into());
+        return Err(failure("input_size_refused"));
     }
     if text.chars().any(|c| (c < '\u{20}' && !matches!(c, '\t' | '\n' | '\r')) || ('\u{7f}'..='\u{9f}').contains(&c)) {
-        return Err("input_control_refused".into());
+        return Err(failure("input_control_refused"));
     }
     Ok(())
 }
@@ -35,24 +66,24 @@ fn unicode_chunks(text: &str) -> Vec<Vec<u16>> {
     chunks
 }
 
-pub fn inject(text: &str) -> Result<(), String> {
+pub fn inject(text: &str) -> Result<(), InputFailure> {
     inject_cancellable(text, Arc::new(AtomicBool::new(false)))
 }
 
 /// Cancellation stops future chunks; it cannot retract events already queued by Windows.
 /// Use a fresh token per injection. Never clear/reuse a cancelled token.
-pub fn inject_cancellable(text: &str, cancel: Arc<AtomicBool>) -> Result<(), String> {
+pub fn inject_cancellable(text: &str, cancel: Arc<AtomicBool>) -> Result<(), InputFailure> {
     ensure_active(&cancel)?;
     validate_text(text)?;
     #[cfg(windows)]
     { native::inject(text, cancel) }
     #[cfg(not(windows))]
-    { let _ = text; Err("windows_input_unavailable".into()) }
+    { let _ = text; Err(failure("windows_input_unavailable")) }
 }
 
 #[cfg(windows)]
 mod native {
-    use super::{unicode_chunks, ensure_active};
+    use super::{unicode_chunks, ensure_active, InputFailure, failure, with_posting_progress};
     use std::{ffi::c_void, mem::size_of, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
     use windows::{core::Interface, Win32::{
         Foundation::{CloseHandle, HANDLE, HWND},
@@ -72,7 +103,7 @@ mod native {
         },
     }};
 
-    type Result<T> = std::result::Result<T, String>;
+    type Result<T> = std::result::Result<T, InputFailure>;
     static BUSY: AtomicBool = AtomicBool::new(false);
     struct BusyGuard;
     impl Drop for BusyGuard { fn drop(&mut self) { BUSY.store(false, Ordering::Release); } }
@@ -98,56 +129,58 @@ mod native {
     struct Array(*mut SAFEARRAY);
     impl Drop for Array { fn drop(&mut self) { if !self.0.is_null() { unsafe { let _ = SafeArrayDestroy(self.0); } } } }
     struct Focus { hwnd: HWND, pid: u32, runtime_id: Vec<i32> }
-    fn err<T>(_: T) -> String { "input_target_refused".into() }
-    fn require(value: bool) -> Result<()> { if value { Ok(()) } else { Err("input_target_refused".into()) } }
+    fn require(value: bool, code: &'static str) -> Result<()> { if value { Ok(()) } else { Err(failure(code)) } }
 
     unsafe fn interactive_desktop() -> Result<()> {
         let mut session = 0;
-        ProcessIdToSessionId(GetCurrentProcessId(), &mut session).map_err(err)?;
-        require(session != 0)?;
-        let desktop = Desktop(OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).map_err(err)?);
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut session).map_err(|_| failure("input_desktop_unavailable"))?;
+        require(session != 0, "input_desktop_unavailable")?;
+        let desktop = Desktop(OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).map_err(|_| failure("input_desktop_unavailable"))?);
         let mut name = [0u16; 256];
         let mut needed = 0;
-        GetUserObjectInformationW(HANDLE(desktop.0.0), UOI_NAME, Some(name.as_mut_ptr().cast()), size_of::<[u16; 256]>() as u32, Some(&mut needed)).map_err(err)?;
-        let end = name.iter().position(|c| *c == 0).ok_or_else(|| err(()))?;
-        require(name[..end] == "Default".encode_utf16().collect::<Vec<_>>())
+        GetUserObjectInformationW(HANDLE(desktop.0.0), UOI_NAME, Some(name.as_mut_ptr().cast()), size_of::<[u16; 256]>() as u32, Some(&mut needed)).map_err(|_| failure("input_desktop_unavailable"))?;
+        let end = name.iter().position(|c| *c == 0).ok_or_else(|| failure("input_desktop_unavailable"))?;
+        require(name[..end] == "Default".encode_utf16().collect::<Vec<_>>(), "input_desktop_unavailable")
     }
 
     unsafe fn integrity(process: HANDLE) -> Result<u32> {
         let mut token = HANDLE::default();
-        OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(err)?;
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(|_| failure("input_integrity_unknown"))?;
         let token = OwnedHandle(token);
         let mut size = 0;
         let _ = GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut size);
-        require(size >= size_of::<TOKEN_MANDATORY_LABEL>() as u32 && size <= 65536)?;
-        // u64 backing gives TOKEN_MANDATORY_LABEL the required alignment on x86/x64/ARM64.
+        require(size >= size_of::<TOKEN_MANDATORY_LABEL>() as u32 && size <= 65536, "input_integrity_unknown")?;
         let mut bytes = vec![0u64; (size as usize + 7) / 8];
-        GetTokenInformation(token.0, TokenIntegrityLevel, Some(bytes.as_mut_ptr().cast()), size, &mut size).map_err(err)?;
+        GetTokenInformation(token.0, TokenIntegrityLevel, Some(bytes.as_mut_ptr().cast()), size, &mut size).map_err(|_| failure("input_integrity_unknown"))?;
         let label = &*bytes.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
-        require(IsValidSid(label.Label.Sid).as_bool())?;
+        require(IsValidSid(label.Label.Sid).as_bool(), "input_integrity_unknown")?;
         let count = GetSidSubAuthorityCount(label.Label.Sid);
-        require(!count.is_null() && *count > 0)?;
+        require(!count.is_null() && *count > 0, "input_integrity_unknown")?;
         let rid = GetSidSubAuthority(label.Label.Sid, u32::from(*count - 1));
-        require(!rid.is_null())?;
+        require(!rid.is_null(), "input_integrity_unknown")?;
         Ok(*rid)
     }
 
-    unsafe fn bool_property(element: &IUIAutomationElement, id: UIA_PROPERTY_ID, expected: bool) -> Result<()> {
-        let value = Variant(element.GetCurrentPropertyValueEx(id, true).map_err(err)?);
-        require(value.exact_bool() == Some(expected))
+    unsafe fn bool_property(element: &IUIAutomationElement, id: UIA_PROPERTY_ID, expected: bool, unknown: &'static str, refused: &'static str) -> Result<()> {
+        let value = Variant(element.GetCurrentPropertyValueEx(id, true).map_err(|_| failure(unknown))?);
+        match value.exact_bool() {
+            Some(actual) => require(actual == expected, refused),
+            None => Err(failure(unknown)),
+        }
     }
     unsafe fn runtime_id(element: &IUIAutomationElement) -> Result<Vec<i32>> {
-        let array = Array(element.GetRuntimeId().map_err(err)?);
-        require(!array.0.is_null() && SafeArrayGetDim(array.0) == 1)?;
-        require(SafeArrayGetVartype(array.0).map_err(err)? == VT_I4)?;
-        let lower = SafeArrayGetLBound(array.0, 1).map_err(err)?;
-        let upper = SafeArrayGetUBound(array.0, 1).map_err(err)?;
+        let code = "input_runtime_id_unavailable";
+        let array = Array(element.GetRuntimeId().map_err(|_| failure(code))?);
+        require(!array.0.is_null() && SafeArrayGetDim(array.0) == 1, code)?;
+        require(SafeArrayGetVartype(array.0).map_err(|_| failure(code))? == VT_I4, code)?;
+        let lower = SafeArrayGetLBound(array.0, 1).map_err(|_| failure(code))?;
+        let upper = SafeArrayGetUBound(array.0, 1).map_err(|_| failure(code))?;
         let count = i64::from(upper) - i64::from(lower) + 1;
-        require((1..=64).contains(&count))?;
+        require((1..=64).contains(&count), code)?;
         let mut values = Vec::with_capacity(count as usize);
         for index in lower..=upper {
             let mut value = 0i32;
-            SafeArrayGetElement(array.0, &index, (&mut value as *mut i32).cast::<c_void>()).map_err(err)?;
+            SafeArrayGetElement(array.0, &index, (&mut value as *mut i32).cast::<c_void>()).map_err(|_| failure(code))?;
             values.push(value);
         }
         Ok(values)
@@ -155,56 +188,58 @@ mod native {
 
     unsafe fn focus(automation: &IUIAutomation) -> Result<Focus> {
         interactive_desktop()?;
-        // Never release or synthesize a modifier that the user is holding.
         for key in [0x10, 0x11, 0x12, 0x5b, 0x5c] {
-            require((GetAsyncKeyState(key) as u16 & 0x8000) == 0)?;
+            require((GetAsyncKeyState(key) as u16 & 0x8000) == 0, "input_modifier_held")?;
         }
         let hwnd = GetForegroundWindow();
-        require(!hwnd.0.is_null())?;
+        require(!hwnd.0.is_null(), "input_foreground_unavailable")?;
         let mut pid = 0;
-        require(GetWindowThreadProcessId(hwnd, Some(&mut pid)) != 0 && pid != 0)?;
-        let process = OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(err)?);
-        require(integrity(process.0)? <= integrity(GetCurrentProcess())?)?;
-        let element = automation.GetFocusedElement().map_err(err)?;
-        require(element.CurrentProcessId().map_err(err)? as u32 == pid)?;
-        bool_property(&element, UIA_IsEnabledPropertyId, true)?;
-        bool_property(&element, UIA_HasKeyboardFocusPropertyId, true)?;
-        bool_property(&element, UIA_IsKeyboardFocusablePropertyId, true)?;
-        bool_property(&element, UIA_IsPasswordPropertyId, false)?;
-        let control = Variant(element.GetCurrentPropertyValueEx(UIA_ControlTypePropertyId, true).map_err(err)?);
-        require(matches!(control.exact_i32(), Some(value) if value == UIA_EditControlTypeId.0 || value == UIA_DocumentControlTypeId.0))?;
-        // Metadata only: do not retrieve document contents, selection text or Value.
-        let writable = match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
-            Ok(value) => !value.CurrentIsReadOnly().map_err(err)?.as_bool(),
+        require(GetWindowThreadProcessId(hwnd, Some(&mut pid)) != 0 && pid != 0, "input_foreground_unavailable")?;
+        let process = OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|_| failure("input_integrity_unknown"))?);
+        require(integrity(process.0)? <= integrity(GetCurrentProcess())?, "input_target_elevated")?;
+        let element = automation.GetFocusedElement().map_err(|_| failure("input_focus_unavailable"))?;
+        require(element.CurrentProcessId().map_err(|_| failure("input_focus_unavailable"))? as u32 == pid, "input_focus_pid_mismatch")?;
+        bool_property(&element, UIA_IsEnabledPropertyId, true, "input_enabled_unknown", "input_target_disabled")?;
+        bool_property(&element, UIA_HasKeyboardFocusPropertyId, true, "input_focus_state_unknown", "input_target_not_focused")?;
+        bool_property(&element, UIA_IsKeyboardFocusablePropertyId, true, "input_focusable_unknown", "input_target_not_focusable")?;
+        bool_property(&element, UIA_IsPasswordPropertyId, false, "input_password_unknown", "input_password_target")?;
+        let control = Variant(element.GetCurrentPropertyValueEx(UIA_ControlTypePropertyId, true).map_err(|_| failure("input_control_type_unknown"))?);
+        let control_type = control.exact_i32().ok_or_else(|| failure("input_control_type_unknown"))?;
+        require(control_type == UIA_EditControlTypeId.0 || control_type == UIA_DocumentControlTypeId.0, "input_unsupported_control")?;
+        // Metadata only: never retrieve target text, titles, process names, Value or selection text.
+        match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+            Ok(value) => require(!value.CurrentIsReadOnly().map_err(|_| failure("input_editability_unknown"))?.as_bool(), "input_target_readonly")?,
             Err(_) => {
-                let text = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).map_err(err)?;
-                let range = text.DocumentRange().map_err(err)?;
-                let read_only = Variant(range.GetAttributeValue(UIA_IsReadOnlyAttributeId).map_err(err)?);
-                read_only.exact_bool() == Some(false) // Mixed/unsupported/default objects are refused.
+                let text = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).map_err(|_| failure("input_unsupported_editability"))?;
+                let range = text.DocumentRange().map_err(|_| failure("input_editability_unknown"))?;
+                let read_only = Variant(range.GetAttributeValue(UIA_IsReadOnlyAttributeId).map_err(|_| failure("input_editability_unknown"))?);
+                match read_only.exact_bool() {
+                    Some(value) => require(!value, "input_target_readonly")?,
+                    None => return Err(failure("input_editability_unknown")),
+                }
             }
-        };
-        require(writable)?;
+        }
         let runtime_id = runtime_id(&element)?;
-        require(GetForegroundWindow() == hwnd)?;
+        require(GetForegroundWindow() == hwnd, "input_focus_changed")?;
         Ok(Focus { hwnd, pid, runtime_id })
     }
 
-    unsafe fn run(text: &str, cancel: &AtomicBool) -> Result<()> {
+    unsafe fn run(text: &str, cancel: &AtomicBool, posting: &AtomicBool) -> Result<()> {
         ensure_active(cancel)?;
-        CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(err)?;
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|_| failure("input_automation_unavailable"))?;
         let _apartment = Apartment;
-        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).map_err(err)?;
-        let settings: IUIAutomation2 = automation.cast().map_err(err)?;
-        settings.SetAutoSetFocus(false).map_err(err)?;
-        settings.SetConnectionTimeout(750).map_err(err)?;
-        settings.SetTransactionTimeout(750).map_err(err)?;
+        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).map_err(|_| failure("input_automation_unavailable"))?;
+        let settings: IUIAutomation2 = automation.cast().map_err(|_| failure("input_automation_unavailable"))?;
+        settings.SetAutoSetFocus(false).map_err(|_| failure("input_automation_unavailable"))?;
+        settings.SetConnectionTimeout(750).map_err(|_| failure("input_automation_unavailable"))?;
+        settings.SetTransactionTimeout(750).map_err(|_| failure("input_automation_unavailable"))?;
         let deadline = Instant::now() + Duration::from_secs(3);
         let initial = focus(&automation)?;
         for chunk in unicode_chunks(text) {
             ensure_active(cancel)?;
             let current = focus(&automation)?;
-            require(current.hwnd == initial.hwnd && current.pid == initial.pid && current.runtime_id == initial.runtime_id)?;
-            if Instant::now() >= deadline { return Err("input_deadline_exceeded".into()); }
+            require(current.hwnd == initial.hwnd && current.pid == initial.pid && current.runtime_id == initial.runtime_id, "input_focus_changed")?;
+            if Instant::now() >= deadline { return Err(failure("input_deadline_exceeded")); }
             let mut events = Vec::with_capacity(chunk.len() * 2);
             for unit in chunk {
                 for up in [false, true] {
@@ -218,8 +253,9 @@ mod native {
             // The final focus check and OS event delivery cannot be made atomic.
             // A partial count is unknown; never retry this text automatically.
             ensure_active(cancel)?;
+            posting.store(true, Ordering::Release); // Arm before the call: even zero is conservatively unknown.
             if SendInput(&events, size_of::<INPUT>() as i32) != events.len() as u32 {
-                return Err("input_posting_unconfirmed".into());
+                return Err(failure("input_posting_unconfirmed"));
             }
         }
         Ok(())
@@ -228,18 +264,20 @@ mod native {
     pub(super) fn inject(text: &str, cancel: Arc<AtomicBool>) -> Result<()> {
         ensure_active(&cancel)?;
         if BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return Err("input_busy".into());
+            return Err(failure("input_busy"));
         }
         let text = text.to_owned();
+        let posting = Arc::new(AtomicBool::new(false));
+        let worker_posting = posting.clone();
         // Dedicated MTA avoids COM apartment conflicts with the WebView/GUI STA.
         // Caller must not run this blocking function on the GUI event loop.
         let worker = std::thread::Builder::new().name("teleport-input".into()).spawn(move || {
             let _busy = BusyGuard;
-            unsafe { run(&text, &cancel) }
+            unsafe { run(&text, &cancel, &worker_posting) }.map_err(|error| with_posting_progress(error, &worker_posting))
         });
         match worker {
-            Ok(worker) => worker.join().unwrap_or_else(|_| Err("input_worker_failed".into())),
-            Err(_) => { BUSY.store(false, Ordering::Release); Err("input_worker_unavailable".into()) }
+            Ok(worker) => worker.join().unwrap_or_else(|_| Err(with_posting_progress(failure("input_worker_failed"), &posting))),
+            Err(_) => { BUSY.store(false, Ordering::Release); Err(failure("input_worker_unavailable")) }
         }
     }
 }
@@ -266,7 +304,7 @@ mod tests {
     }
     #[test] fn already_cancelled_refuses_before_platform_work() {
         let cancel = Arc::new(AtomicBool::new(true));
-        assert_eq!(inject_cancellable("harmless", cancel), Err("input_cancelled".into()));
+        assert_eq!(inject_cancellable("harmless", cancel), Err(failure("input_cancelled")));
     }
     #[test] fn cancellation_is_observed_between_chunks() {
         let cancel = AtomicBool::new(false);
@@ -274,8 +312,25 @@ mod tests {
         assert!(ensure_active(&cancel).is_ok());
         assert!(chunks.next().is_some());
         cancel.store(true, Ordering::Release);
-        assert_eq!(ensure_active(&cancel), Err("input_cancelled".into()));
+        assert_eq!(ensure_active(&cancel), Err(failure("input_cancelled")));
         assert!(chunks.next().is_some()); // Remaining data exists, but must not be posted.
+    }
+    #[test] fn posting_attempt_permanently_changes_errors_to_unknown() {
+        let posting = AtomicBool::new(false);
+        assert!(!with_posting_progress(failure("input_password_target"), &posting).may_have_posted);
+        posting.store(true, Ordering::Release);
+        for code in ["input_cancelled", "input_focus_changed", "input_worker_failed", "input_posting_unconfirmed"] {
+            let error = with_posting_progress(failure(code), &posting);
+            assert_eq!(error.code, code);
+            assert!(error.may_have_posted);
+        }
+        let already_unknown = InputFailure { code: "input_worker_failed", may_have_posted: true };
+        assert!(with_posting_progress(already_unknown, &AtomicBool::new(false)).may_have_posted);
+    }
+    #[test] fn diagnostic_codes_are_fixed_and_unique() {
+        let unique: std::collections::HashSet<_> = INPUT_FAILURE_CODES.iter().collect();
+        assert_eq!(unique.len(), INPUT_FAILURE_CODES.len());
+        assert!(INPUT_FAILURE_CODES.iter().all(|code| code.chars().all(|c| c.is_ascii_lowercase() || c == '_')));
     }
     #[cfg(windows)]
     #[test] fn official_input_union_has_platform_layout() {
@@ -283,5 +338,5 @@ mod tests {
         assert_eq!(std::mem::size_of::<INPUT>(), if std::mem::size_of::<usize>() == 8 { 40 } else { 28 });
     }
     #[cfg(not(windows))]
-    #[test] fn non_windows_refuses_input() { assert_eq!(inject("harmless"), Err("windows_input_unavailable".into())); }
+    #[test] fn non_windows_refuses_input() { assert_eq!(inject("harmless"), Err(failure("windows_input_unavailable"))); }
 }

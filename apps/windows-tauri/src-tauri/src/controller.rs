@@ -101,9 +101,9 @@ impl Safety {
         if active.is_some() { return Err("input_busy".into()); }
         let token=Arc::new(AtomicBool::new(false)); *active=Some(token.clone()); Ok(token)
     }
-    fn finish(&self, token:&Arc<AtomicBool>) {
+    fn finish(&self, token:&Arc<AtomicBool>) -> bool {
         let mut active=self.active.lock().unwrap_or_else(|e|e.into_inner());
-        if active.as_ref().is_some_and(|current|Arc::ptr_eq(current,token)) { *active=None; }
+        if active.as_ref().is_some_and(|current|Arc::ptr_eq(current,token)) { *active=None; true } else { false }
     }
 }
 #[derive(Clone)]
@@ -138,7 +138,7 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
 }
 
 struct Pending { public_key: String, name: String, expires: u64, confirmed: bool }
-enum Event { Frame(u64, Value), Closed(u64, Option<String>), Injected { generation: u64, device_id: String, message_id: String, success: bool, token: Arc<AtomicBool> } }
+enum Event { Frame(u64, Value), Closed(u64, Option<String>), Injected { generation: u64, device_id: String, message_id: String, result: Result<(),input::InputFailure>, token: Arc<AtomicBool> } }
 struct Actor {
     safety: Arc<Safety>,
     path: PathBuf, emit: Emit, state: Option<Value>, http: reqwest::Client,
@@ -168,16 +168,8 @@ impl Actor {
                             self.disconnected();
                             if let Some(code)=error { (self.emit)("notice",json!(code)); }
                         },
-                        Event::Injected {generation, device_id, message_id, success, token} => {
-                            self.safety.finish(&token);
-                            let success=success && !token.load(Ordering::Acquire);
-                            self.injecting = false;
-                            if generation == self.generation && self.online.contains(&device_id) {
-                                let ack = if success { json!({"kind":"ack","id":message_id,"status":"injected"}) }
-                                    else { json!({"kind":"ack","id":message_id,"status":"unknown","code":"injection_unconfirmed"}) };
-                                // ACK loss is intentionally not retried; sender must display unknown.
-                                let _ = self.encrypted(&device_id,ack);
-                            }
+                        Event::Injected {generation, device_id, message_id, result, token} => {
+                            self.injection_finished(generation,&device_id,&message_id,result,&token);
                         },
                         _ => {}
                     }
@@ -185,6 +177,26 @@ impl Actor {
                 _ = tokio::time::sleep_until(wake), if self.retry.is_some() => { self.retry = None; if !self.stopped { self.connect(); } }
             }
         }
+    }
+    fn input_result(&self, status:&str, code:Option<&str>) {
+        let mut result=json!({"status":if status=="injected" {"submitted"} else {status}});
+        if let Some(code)=code { result["code"]=json!(code); }
+        (self.emit)("input-result",result);
+    }
+    fn injection_finished(&mut self,generation:u64,device_id:&str,message_id:&str,result:Result<(),input::InputFailure>,token:&Arc<AtomicBool>) {
+        // A delayed/duplicate completion must not clear another injection's busy state.
+        if !self.safety.finish(token) { return; }
+        self.injecting=false;
+        if generation!=self.generation { return; }
+        let (status,code)=native_outcome(result,token.load(Ordering::Acquire));
+        if self.online.contains(device_id) {
+            let mut ack=json!({"kind":"ack","id":message_id,"status":status});
+            if let Some(code)=code { ack["code"]=json!(code); }
+            // No retry if ACK cannot be delivered. The phone must retain unknown state.
+            let _=self.encrypted(device_id,ack);
+        }
+        // No message body, title, key, token, device ID, or message ID leaves in UI diagnostics.
+        self.input_result(status,code);
     }
     fn status(&self) -> Value {
         let devices = self.state.as_ref().and_then(|s| s["peers"].as_object()).map(|peers| peers.iter().map(|(id,p)| json!({"deviceId":id,"name":p["name"],"online":self.online.contains(id)})).collect::<Vec<_>>()).unwrap_or_default();
@@ -398,19 +410,33 @@ impl Actor {
         let context = json!({"roomId":state["roomId"],"sender":id,"recipient":"owner"});
         let payload = protocol::open(&message["envelope"],&context,string(peer,"publicKey")?,string(state,"secretKey")?)?;
         let authorized = self.online.contains(id) && self.state()?.get("peers").and_then(|p| p.get(id)).is_some();
-        if let Err(code) = self.gate.accept(&payload,&self.session,now(),self.paused || self.safety.emergency.load(Ordering::SeqCst),authorized) {
+        // A replay may refer to an earlier accepted operation still running or already
+        // partially posted. It must never overwrite that operation with a certain rejection,
+        // including when Pause was requested after the first acceptance.
+        let repeated=payload["id"].as_str().is_some_and(|id|self.gate.seen.contains_key(id));
+        let gate_result=if repeated { Err("duplicate") } else {
+            self.gate.accept(&payload,&self.session,now(),self.paused || self.safety.emergency.load(Ordering::SeqCst),authorized)
+        };
+        if let Err(code) = gate_result {
+            // Expired IDs may already have been pruned from the bounded dedupe cache.
+            // A suspended phone can still await that original operation, so expiry cannot
+            // prove no prior posting (even if Pause was the gate's first refusal).
+            let expired=payload["expiresAt"].as_u64().is_some_and(|expiry|expiry<=now());
+            let status=if code=="duplicate" || expired {"unknown"} else {"rejected"};
+            self.input_result(status,Some(code));
             if let Some(message_id) = payload["id"].as_str().filter(|id| id.len() <= 64) {
-                self.encrypted(id,json!({"kind":"ack","id":message_id,"status":"rejected","code":code}))?;
+                self.encrypted(id,json!({"kind":"ack","id":message_id,"status":status,"code":code}))?;
             }
             return Ok(());
         }
         if self.injecting {
+            self.input_result("rejected",Some("input_busy"));
             self.encrypted(id,json!({"kind":"ack","id":payload["id"],"status":"rejected","code":"input_busy"}))?;
             return Ok(());
         }
         let token=match self.safety.begin() {
             Ok(token)=>token,
-            Err(code)=> { self.encrypted(id,json!({"kind":"ack","id":payload["id"],"status":"rejected","code":code}))?; return Ok(()); }
+            Err(code)=> { self.input_result("rejected",Some(&code)); self.encrypted(id,json!({"kind":"ack","id":payload["id"],"status":"rejected","code":code}))?; return Ok(()); }
         };
         let text = string(&payload,"text")?.to_owned();
         let device_id = id.to_owned(); let message_id = string(&payload,"id")?.to_owned();
@@ -421,8 +447,9 @@ impl Actor {
         // the native call really returns: dropping a timed-out blocking task cannot stop it.
         tokio::spawn(async move {
             let native_token=token.clone();
-            let result = tokio::task::spawn_blocking(move || input::inject_cancellable(&text,native_token)).await;
-            let _ = events.send(Event::Injected {generation,device_id,message_id,success:matches!(result,Ok(Ok(()))),token}).await;
+            let result = tokio::task::spawn_blocking(move || input::inject_cancellable(&text,native_token)).await
+                .unwrap_or_else(|_|Err(input::InputFailure {code:"input_worker_failed",may_have_posted:true}));
+            let _ = events.send(Event::Injected {generation,device_id,message_id,result,token}).await;
         });
         Ok(())
     }
@@ -471,6 +498,20 @@ async fn transport(url: String, token: String, generation: u64, mut outbound: mp
                     .await.map_err(|_| "send_timeout")?.map_err(|_| "send_failed")?;
             }
         }
+    }
+}
+
+// Native code records whether SendInput was ever attempted, not just whether it returned
+// success. Only known, certain pre-post refusals are allowed to claim "rejected".
+fn native_outcome(result:Result<(),input::InputFailure>,cancelled:bool)->(&'static str,Option<&'static str>) {
+    match result {
+        Ok(()) if !cancelled => ("injected",None),
+        Ok(()) => ("unknown",Some("input_cancelled")),
+        Err(failure) if failure.code=="input_worker_failed" => ("unknown",Some("input_worker_failed")),
+        Err(failure) if input::INPUT_FAILURE_CODES.contains(&failure.code) => {
+            (if failure.may_have_posted {"unknown"} else {"rejected"},Some(failure.code))
+        }
+        Err(_) => ("unknown",Some("injection_unconfirmed")),
     }
 }
 
@@ -684,6 +725,104 @@ mod tests {
         assert_eq!(websocket_error(connect),"relay_connect_failed");
         let response=tokio_tungstenite::tungstenite::http::Response::builder().status(403).body(Some(b"private-secret-token".to_vec())).unwrap();
         assert_eq!(websocket_error(tokio_tungstenite::tungstenite::Error::Http(Box::new(response))),"relay_websocket_http_403");
+    }
+
+    #[test] fn native_outcomes_preserve_certain_refusals_and_possible_partial_results() {
+        for &code in input::INPUT_FAILURE_CODES {
+            let expected=if code=="input_worker_failed" {"unknown"} else {"rejected"};
+            assert_eq!(native_outcome(Err(input::InputFailure{code,may_have_posted:false}),false),(expected,Some(code)));
+            assert_eq!(native_outcome(Err(input::InputFailure{code,may_have_posted:true}),false),("unknown",Some(code)));
+        }
+        assert_eq!(native_outcome(Ok(()),false),("injected",None));
+        assert_eq!(native_outcome(Ok(()),true),("unknown",Some("input_cancelled")));
+        assert_eq!(native_outcome(Err(input::InputFailure{code:"input_cancelled",may_have_posted:false}),true),("rejected",Some("input_cancelled")));
+        assert_eq!(native_outcome(Err(input::InputFailure{code:"private text title or token",may_have_posted:false}),false),("unknown",Some("injection_unconfirmed")));
+    }
+    #[tokio::test] async fn native_completion_emits_precise_private_desktop_event_and_encrypted_ack() {
+        for (result,cancelled,status,code) in [
+            (Ok(()),false,"injected",None),
+            (Err(input::InputFailure{code:"input_unsupported_control",may_have_posted:false}),false,"rejected",Some("input_unsupported_control")),
+            (Err(input::InputFailure{code:"input_focus_changed",may_have_posted:true}),false,"unknown",Some("input_focus_changed")),
+            (Err(input::InputFailure{code:"input_worker_failed",may_have_posted:false}),false,"unknown",Some("input_worker_failed")),
+            (Ok(()),true,"unknown",Some("input_cancelled")),
+        ] {
+            let (mut actor,mut output,phone,id)=actor_fixture();
+            let events=Arc::new(Mutex::new(Vec::new())); let captured=events.clone();
+            actor.emit=Arc::new(move |name,value|captured.lock().unwrap().push((name.to_owned(),value)));
+            actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap(); let token=actor.safety.begin().unwrap(); actor.injecting=true;
+            if cancelled { token.store(true,Ordering::Release); }
+            let message_id=Uuid::new_v4().to_string();
+            actor.injection_finished(actor.generation,&id,&message_id,result,&token);
+            let ack=decrypt_outbound(&actor,&phone,&id,&output.try_recv().unwrap());
+            assert_eq!(ack["status"],status); assert_eq!(ack["id"],message_id);
+            assert_eq!(ack.get("code").and_then(Value::as_str),code);
+            let events=events.lock().unwrap(); assert_eq!(events.len(),1); assert_eq!(events[0].0,"input-result");
+            assert_eq!(events[0].1["status"],if status=="injected" {"submitted"} else {status});
+            assert_eq!(events[0].1.get("code").and_then(Value::as_str),code);
+            assert!(events[0].1.as_object().unwrap().keys().all(|key|key=="status"||key=="code"));
+            assert!(!actor.injecting);
+        }
+    }
+    #[tokio::test] async fn stale_completion_emits_nothing_and_cannot_clear_another_injection() {
+        let (mut actor,mut output,_,id)=actor_fixture();
+        let events=Arc::new(Mutex::new(Vec::new())); let captured=events.clone();
+        actor.emit=Arc::new(move |name,value|captured.lock().unwrap().push((name.to_owned(),value)));
+        actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap(); let current=actor.safety.begin().unwrap(); actor.injecting=true;
+        let stale=Arc::new(AtomicBool::new(true));
+        actor.injection_finished(actor.generation,&id,"old-message",Ok(()),&stale);
+        assert!(actor.injecting); assert!(actor.safety.begin().is_err());
+        actor.injection_finished(actor.generation.wrapping_sub(1),&id,"old-message",Ok(()),&current);
+        assert!(!actor.injecting); assert!(events.lock().unwrap().is_empty()); assert!(output.try_recv().is_err());
+    }
+    #[tokio::test] async fn offline_peer_still_gets_local_diagnostic_without_queued_ack() {
+        let (mut actor,mut output,_,id)=actor_fixture(); actor.online.clear();
+        let events=Arc::new(Mutex::new(Vec::new())); let captured=events.clone();
+        actor.emit=Arc::new(move |name,value|captured.lock().unwrap().push((name.to_owned(),value)));
+        actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap(); let token=actor.safety.begin().unwrap(); actor.injecting=true;
+        actor.injection_finished(actor.generation,&id,"private-message-id",Err(input::InputFailure{code:"input_password_target",may_have_posted:false}),&token);
+        assert!(output.try_recv().is_err()); assert_eq!(events.lock().unwrap()[0].1,json!({"status":"rejected","code":"input_password_target"}));
+    }
+
+    #[tokio::test] async fn duplicate_of_accepted_operation_is_unknown_even_after_pause() {
+        for paused in [false,true] {
+            let (mut actor,mut output,phone,id)=actor_fixture();
+            let events=Arc::new(Mutex::new(Vec::new())); let captured=events.clone();
+            actor.emit=Arc::new(move |name,value|captured.lock().unwrap().push((name.to_owned(),value)));
+            actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap();
+            let message=phone_message(&actor,&phone,&id); let state=actor.state().unwrap();
+            let context=json!({"roomId":state["roomId"],"sender":id,"recipient":"owner"});
+            let payload=protocol::open(&message["envelope"],&context,string(&phone,"publicKey").unwrap(),string(state,"secretKey").unwrap()).unwrap();
+            actor.gate.accept(&payload,&actor.session,now(),false,true).unwrap();
+            // Simulate an already-accepted original operation that may have posted.
+            actor.injecting=true; actor.paused=paused;
+            actor.receive_text(&message).await.unwrap();
+            let ack=decrypt_outbound(&actor,&phone,&id,&output.try_recv().unwrap());
+            assert_eq!(ack["id"],payload["id"]); assert_eq!(ack["status"],"unknown"); assert_eq!(ack["code"],"duplicate");
+            assert_eq!(events.lock().unwrap()[0].1,json!({"status":"unknown","code":"duplicate"}));
+            assert!(actor.injecting); // No second native attempt or original-operation cancellation.
+        }
+    }
+
+    #[tokio::test] async fn expired_replay_after_dedupe_pruning_is_unknown_even_when_paused() {
+        for paused in [false,true] {
+            let (mut actor,mut output,phone,id)=actor_fixture(); let time=now();
+            actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap();
+            let payload=json!({"kind":"text","id":Uuid::new_v4().to_string(),"sessionId":actor.session,
+                "sentAt":time-2000,"expiresAt":time-1000,"text":"old accepted operation"});
+            actor.gate.accept(&payload,&actor.session,time-1500,false,true).unwrap();
+            let newer=json!({"kind":"text","id":Uuid::new_v4().to_string(),"sessionId":actor.session,
+                "sentAt":time,"expiresAt":time+15000,"text":"newer operation"});
+            actor.gate.accept(&newer,&actor.session,time,false,true).unwrap();
+            assert!(!actor.gate.seen.contains_key(payload["id"].as_str().unwrap()));
+            let state=actor.state().unwrap();
+            let context=json!({"roomId":state["roomId"],"sender":id,"recipient":"owner"});
+            let envelope=protocol::seal(&payload,&context,string(state,"publicKey").unwrap(),string(&phone,"secretKey").unwrap()).unwrap();
+            actor.paused=paused;
+            actor.receive_text(&json!({"type":"data","from":id,"envelope":envelope})).await.unwrap();
+            let ack=decrypt_outbound(&actor,&phone,&id,&output.try_recv().unwrap());
+            assert_eq!(ack["id"],payload["id"]); assert_eq!(ack["status"],"unknown");
+            assert_eq!(ack["code"],if paused {"paused"} else {"expired"}); assert!(!actor.injecting);
+        }
     }
 
 }

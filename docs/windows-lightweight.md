@@ -45,3 +45,9 @@ Setup and later status refresh failures now report separate stages and reviewed 
 Current proxy boundary: HTTP reads inherited proxy environment variables; it does not currently import Windows Internet Settings/PAC. WebSocket connections are direct and do not automatically use proxy environment variables or Windows proxy settings. Browser reachability therefore does not prove backend reachability. TLS verification remains strict.
 
 An explicitly opted-in Windows CI check creates a synthetic room, uses the production Rust HTTP and WebSocket transport, verifies authentication and deletes the room. It does not use native input or real user text. Ordinary unit tests skip this live test; no Cloudflare account credential is required.
+
+### alpha.3 input outcome diagnostics
+
+Desktop and phone now show native input results separately from connection errors. A refusal known to occur before any OS input attempt is `rejected`; any possible partial input, uncertain posting, late cancellation or worker failure is `unknown`. An accepted OS event stream is `submitted` on desktop (`injected` in the existing encrypted protocol for compatibility), not proof that a target application accepted or saved the text. No automatic resend is added.
+
+Only reviewed static reason codes are exposed: no input text, window title, process name or raw exception is sent in diagnostics. Password, UIAutomation editability, focus, integrity/UIPI and cancellation safeguards remain enforced; this release does not add a compatibility bypass or claim tested WeChat support. Unknown/custom widgets can still be refused, now with a specific reason.

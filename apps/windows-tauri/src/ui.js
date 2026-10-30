@@ -15,6 +15,15 @@ const ERROR_DETAILS = new Map([
   ['relay_proxy_failed','The relay connection reported a proxy failure.'],
   ['relay_connect_failed','The desktop client could not establish the relay connection.'],
   ['relay_websocket_failed','The relay WebSocket connection failed.'],
+  ['auth_failed','The receiver could not send its relay authentication.'],
+  ['auth_timeout','Relay authentication timed out.'],
+  ['invalid_auth','The relay authentication response was not accepted.'],
+  ['socket_closed','The relay WebSocket connection closed.'],
+  ['socket_error','The relay WebSocket reported a connection error.'],
+  ['invalid_message','An invalid relay message was refused.'],
+  ['oversized_frame','An oversized relay message was refused.'],
+  ['send_timeout','Sending to the relay timed out.'],
+  ['send_failed','Sending to the relay failed.'],
   ['relay_offline','Connect to the relay before retrying this operation.'],
   ['relay_busy_or_offline','The relay connection is unavailable or busy.'],
   ['invalid_relay_response','The relay response was not valid JSON in the expected format.'],
@@ -45,6 +54,57 @@ const ERROR_DETAILS = new Map([
   ['newer_stop_requested','A newer pause or disconnect took priority. Input remains paused.'],
 ]);
 for(let status=100;status<=599;status++){ERROR_DETAILS.set(`relay_http_${status}`,`The relay returned HTTP ${status}.`);ERROR_DETAILS.set(`relay_websocket_http_${status}`,`The WebSocket handshake returned HTTP ${status}.`);}
+const INPUT_DETAILS = new Map([
+  ['input_worker_failed','The input worker could not confirm completion.'],
+  ['input_worker_unavailable','The input worker could not be started.'],
+  ['input_cancelled','Input was cancelled by a newer stop or safety action.'],
+  ['input_size_refused','The text size was refused by the native input guard.'],
+  ['input_control_refused','Control characters were refused by the native input guard.'],
+  ['windows_input_unavailable','Native Windows input is unavailable in this environment.'],
+  ['input_desktop_unavailable','A supported interactive Windows desktop could not be verified.'],
+  ['input_integrity_unknown','The target security level could not be verified.'],
+  ['input_target_elevated','The target runs at a higher security level. Use a normal, non-elevated target; do not bypass this guard.'],
+  ['input_modifier_held','Release Shift, Ctrl, Alt and Windows keys before trying again.'],
+  ['input_foreground_unavailable','The foreground target could not be verified.'],
+  ['input_focus_unavailable','Windows accessibility could not identify the focused target.'],
+  ['input_focus_pid_mismatch','The focused element did not match the foreground application.'],
+  ['input_enabled_unknown','The target enabled state could not be verified.'],
+  ['input_target_disabled','The target control is disabled.'],
+  ['input_focus_state_unknown','The keyboard focus state could not be verified.'],
+  ['input_target_not_focused','The target does not have keyboard focus.'],
+  ['input_focusable_unknown','The target focusability could not be verified.'],
+  ['input_target_not_focusable','The target cannot receive keyboard focus.'],
+  ['input_password_unknown','Windows did not establish that the target is a non-password field. The safety guard remains active.'],
+  ['input_password_target','Password fields are blocked. Choose a non-password editable field.'],
+  ['input_control_type_unknown','The target control type could not be verified.'],
+  ['input_unsupported_control','The target is not a supported editable control.'],
+  ['input_target_readonly','The target is read-only.'],
+  ['input_editability_unknown','Windows accessibility could not verify that the target is editable.'],
+  ['input_unsupported_editability','The target does not expose the supported editable-field metadata.'],
+  ['input_runtime_id_unavailable','A stable target identity could not be verified.'],
+  ['input_focus_changed','The focused target changed during the operation.'],
+  ['input_automation_unavailable','Windows accessibility automation is unavailable.'],
+  ['input_deadline_exceeded','The native input operation exceeded its time limit.'],
+  ['input_posting_unconfirmed','Windows did not confirm all requested input events.'],
+  ['input_busy','Another input operation is still finishing.'],
+  ['injection_unconfirmed','Input completion could not be confirmed.'],
+  ['unauthorized','The sending phone is not authorized.'],
+  ['paused','Input is paused. Resume explicitly before a new send.'],
+  ['invalid_message','The received message was refused.'],
+  ['invalid_text','The received text failed the safety checks.'],
+  ['session_mismatch','The message belongs to an earlier receiver session.'],
+  ['expired','The message expired before it could be accepted.'],
+  ['duplicate','This message was already handled. Inspect the target before a new send.'],
+  ['rate_limited','The receiver temporarily refused additional messages.'],
+]);
+function inputDiagnostic(result){
+  const status=['submitted','rejected','unknown'].includes(result?.status)?result.status:'unknown';
+  if(status==='submitted')return 'Input diagnostic — submitted. Windows accepted the input events; this does not verify that the target app accepted or saved the text. Inspect the target field.';
+  const code=typeof result?.code==='string'&&INPUT_DETAILS.has(result.code)?result.code:'unknown_input_result';
+  const detail=INPUT_DETAILS.get(code)||'Unrecognized technical details were withheld to protect private data.';
+  const outcome=status==='rejected'?'This attempt was rejected. Inspect the target and resolve the issue before sending again.':'Some or all text may already have been entered. Inspect the target field before any manual retry; Teleport does not automatically resend.';
+  return `Input diagnostic — ${status} [${code}]. ${detail} ${outcome}`;
+}
 const STAGES={setup:'Setup command',setup_status:'Status refresh after successful setup',status:'Status refresh',pause:'Change input state',connection:'Change relay connection',pairing:'Create pairing code',approve:'Pairing approval',revoke:'Revoke phone',reset:'Reset room'};
 class UiFailure extends Error{constructor(stage,code){super('Safe UI diagnostic');this.stage=stage;this.code=code;}}
 function safeCode(error){const value=typeof error==='string'?error:error instanceof Error?error.message:typeof error?.code==='string'?error.code:'';return ERROR_DETAILS.has(value)?value:'unknown_error';}
@@ -115,7 +175,8 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
   document.addEventListener('click',blockLink,true);document.addEventListener('drop',blockDrop);document.addEventListener('dragover',blockDrop);
   unlisten.push(await listen('status',event=>render(event.payload)));
   const knownNotices=new Set(['Message refused or connection error.','Relay refused an operation. Check authorization and connection.']);
-  unlisten.push(await listen('notice',event=>notice(knownNotices.has(event.payload)?event.payload:safeCode(event.payload)!=='unknown_error'?diagnostic(new UiFailure('connection',safeCode(event.payload))):'Receiver notice. Unrecognized details were withheld to protect private data.')));
+  unlisten.push(await listen('notice',event=>notice(knownNotices.has(event.payload)?event.payload:typeof event.payload==='string'&&INPUT_DETAILS.has(event.payload)&&(event.payload.startsWith('input_')||event.payload==='windows_input_unavailable'||event.payload==='injection_unconfirmed')?inputDiagnostic({status:'unknown',code:event.payload}):safeCode(event.payload)!=='unknown_error'?diagnostic(new UiFailure('connection',safeCode(event.payload))):'Receiver notice. Unrecognized details were withheld to protect private data.')));
+  unlisten.push(await listen('input-result',event=>notice(inputDiagnostic(event.payload))));
   unlisten.push(await listen('pair-request',event=>{
     if(!state.connected)return;clearPending();clearQR();pending=event.payload;$('phoneName').textContent=pending.name;$('sas').textContent=pending.sas;$('approval').hidden=false;
     pendingTimer=setTimer(clearPending,Math.min(120000,Math.max(0,(pending.expiresAt||now()+120000)-now())));renderControls();

@@ -19,3 +19,9 @@ Browser tests need Chromium and permission to create local sockets. Set `CHROMIU
 - Reconnect uses capped exponential backoff with jitter and online/foreground signals. Manual disconnect is persisted and disables reconnection until explicit reconnect.
 - Forget attempts server revocation before deleting local keys; failure is disclosed with an instruction to remove the phone on desktop. Reset clears only this browser and explicitly warns that desktop revocation is still needed.
 - Manifest and icons support installation. No service worker is registered; no secret API responses or outbound messages are cached for offline replay.
+
+### Input diagnostics
+
+Phone status separates connection readiness from the last send result. Disabled-send hints explain missing pairing, manual disconnect, offline/unready/paused states and empty/oversized drafts. While awaiting ACK, the button displays a 15-second countdown. Timeout or interrupted delivery remains unknown, never a retry trigger.
+
+An `injected` ACK only means OS input events were submitted, **not** that the target application received or displayed text. Rejected/unknown outcomes show translated, whitelisted native codes (and their static `[code]` identifiers). Arbitrary exception strings/codes are discarded. ACK status, not an individual error code, determines whether input may have occurred; focus/guard checks can fail after earlier chunks were submitted.

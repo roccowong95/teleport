@@ -18,7 +18,7 @@ test('real browser → local Cloudflare DO → encrypted desktop mock, persisten
   await receiver.approve(pairing.deviceId,true); await until(()=>!!receiver.state.peers[pairing.deviceId]);
   await page.locator('#draft').fill('你好，Teleport 👩🏽‍💻\n第二行 — café');
   await expect(page.locator('#send')).toBeDisabled(); await receiver.pause(false);
-  await page.locator('#send').click(); await page.getByText('已输入到电脑。',{exact:false}).waitFor();
+  await page.locator('#send').click(); await page.getByText('电脑已提交输入事件，但无法确认目标应用是否接收。',{exact:false}).waitFor();
   assert.deepEqual(texts,['你好，Teleport 👩🏽‍💻\n第二行 — café']); assert.equal(await page.locator('#draft').inputValue(),texts[0]);
   await page.screenshot({path:'test-results/phone-connected.png',fullPage:true});
   await page.reload(); await page.locator('#status').filter({hasText:'已安全连接'}).waitFor(); assert.equal(texts.length,1);

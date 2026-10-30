@@ -1,6 +1,7 @@
 import { generateIdentity, randomToken, decodePairing, seal, open, sas, utf8Length } from '@teleport/protocol';
-import { validateEndpoint, canSend, retryDelay } from './security.mjs';
+import { validateEndpoint, retryDelay } from './security.mjs';
 import './style.css';
+import { ackMessage, sendBlockReason, unknownMessage } from './diagnostics.mjs';
 
 type Device = { roomId: string; endpoint: string; name: string; ownerPublicKey: string; deviceId: string; clientToken: string; publicKey: string; secretKey: string; approved: boolean; enabled: boolean };
 type Pair = { v: number; roomId: string; endpoint: string; name: string; ownerPublicKey: string; pairToken: string; expiresAt: number };
@@ -12,7 +13,7 @@ let active: Device | undefined = devices[0];
 let pair: Pair | undefined;
 let socket: WebSocket | undefined;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-let pending: { id: string; timer: ReturnType<typeof setTimeout> } | undefined;
+let pending: { id: string; timer: ReturnType<typeof setTimeout>; startedAt: number } | undefined;
 let sessionId = '';
 let targetLabel = '';
 let paused = false;
@@ -23,6 +24,7 @@ let operationEpoch = 0;
 let status = '尚未连接';
 let result = '文字只在你点击发送时传输，不会自动重试。';
 let sasCode = '';
+let sendCount = 0;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
 <header class="topbar"><a class="brand" href="/" aria-label="Teleport 首页"><span class="brandmark">T<span>↗</span></span>teleport<span class="beta">预览版</span></a><span class="private"><span class="lock">◇</span> 端到端加密</span></header>
@@ -30,8 +32,8 @@ app.innerHTML = `
 <div class="workspace"><section class="composer card"><div class="section-head"><div><span class="step">01</span><h2>你的文字</h2></div><span id="counter" class="counter">0 / 8192 字节</span></div>
 <label class="sr-only" for="draft">要发送到电脑的文字</label><textarea id="draft" placeholder="在这里输入、粘贴，或使用手机键盘的语音输入…" maxlength="8192" spellcheck="false"></textarea>
 <div class="editor-foot"><span>↵ 换行不会发送</span><button id="clear" class="text-button" type="button">清空文字</button></div>
-<div class="send-zone"><button id="send" class="primary send" type="button" disabled><span>发送到电脑</span><span aria-hidden="true">↗</span></button><p id="send-hint">先连接一台电脑，再把光标放到输入位置。</p></div>
-<div id="result" class="result" role="status" aria-live="polite"></div></section>
+<div class="send-zone"><button id="send" class="primary send" type="button" aria-describedby="send-hint result" disabled><span>发送到电脑</span><span aria-hidden="true">↗</span></button><p id="send-hint" role="status" aria-live="polite">先连接一台电脑，再把光标放到输入位置。</p></div>
+<div id="result-label" class="result-label">最近一次发送 / 操作结果</div><div id="result" class="result" role="status" aria-live="polite"></div></section>
 <aside><section class="connection card"><div class="section-head"><div><span class="step">02</span><h2>连接电脑</h2></div><span id="status-dot" class="dot"></span></div>
 <div id="pair-panel" hidden><div class="pair-illustration" aria-hidden="true">▯ <span>⟷</span> ▱</div><h3 id="pair-name"></h3><p>只连接你面前的电脑。下一步将显示核对码，请与电脑端逐字核对。</p><button id="pair" class="primary" type="button">开始安全配对</button></div>
 <div id="empty"><div class="pair-illustration" aria-hidden="true">▯ <span>⟷</span> ▱</div><h3>扫一下，连接起来</h3><p>在电脑上打开 Teleport，使用手机相机扫描配对二维码。</p><ol><li>电脑端创建配对二维码</li><li>手机扫码，核对安全码</li><li>在电脑端批准连接</li></ol></div>
@@ -45,8 +47,11 @@ function update() {
  const bytes = utf8Length(draft.value);
  $('counter').textContent = `${bytes} / 8192 字节`;
  $('counter').classList.toggle('danger', bytes > 8192);
- $<HTMLButtonElement>('send').disabled = !canSend({ connected, ready: !!sessionId, approved: active?.approved === true, paused, pending: !!pending, bytes });
- $('send-hint').textContent = pending ? '正在等待电脑确认，请勿重复发送。' : paused ? '电脑已暂停接收，请在电脑端恢复。' : sessionId ? `将输入到：${targetLabel || '电脑当前焦点窗口'}。发送前请确认光标。` : '先连接一台电脑，再把光标放到输入位置。';
+ const blockReason = sendBlockReason({ hasDevice: !!active, enabled: active?.enabled === true, online: navigator.onLine, connected: connected && socket?.readyState === WebSocket.OPEN, approved: active?.approved === true, ready: !!sessionId, paused, pending: !!pending, bytes });
+ $<HTMLButtonElement>('send').disabled = !!blockReason;
+ $('send-hint').textContent = blockReason || `将输入到：${targetLabel || '电脑当前焦点窗口'}。发送前请确认光标。`;
+ $('send').querySelector('span')!.textContent = pending ? `等待电脑确认 · ${Math.max(0, 15 - Math.floor((Date.now() - pending.startedAt) / 1000))} 秒` : '发送到电脑';
+ $('send').setAttribute('aria-busy', String(!!pending));
  $('result').textContent = result;
  $('status').textContent = status;
  $('target').textContent = sessionId ? (paused ? '接收已暂停' : '加密通道就绪') : '';
@@ -64,7 +69,7 @@ function update() {
  if (select.dataset.names !== names) { select.replaceChildren(...devices.map(d => { const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.name; return o; })); select.dataset.names = names; }
  select.value = active?.deviceId || '';
 }
-function unknown() { if (pending) { clearTimeout(pending.timer); pending = undefined; result = '结果未知：可能已经输入，也可能未输入。请先检查电脑；草稿已保留，不会自动重发。'; } }
+function unknown(reason = 'disconnected') { if (pending) { clearTimeout(pending.timer); pending = undefined; result = unknownMessage(reason); } }
 function stop() { clearTimeout(reconnectTimer); reconnectTimer = undefined; const old = socket; socket = undefined; old?.close(); connected = false; sessionId = ''; targetLabel = ''; unknown(); }
 function schedule() {
  if (!active?.enabled || reconnectTimer || !navigator.onLine || document.visibilityState === 'hidden') return;
@@ -94,7 +99,7 @@ async function connect() {
     else if (message.type === 'data' && message.from === 'owner') {
      const payload = open(message.envelope, { roomId: device.roomId, sender: 'owner', recipient: device.deviceId }, device.ownerPublicKey, device.secretKey);
      if (payload.kind === 'ready' && typeof payload.sessionId === 'string' && payload.sessionId.length > 0 && typeof payload.paused === 'boolean') { if (sessionId && sessionId !== payload.sessionId) unknown(); sessionId = payload.sessionId; paused = payload.paused; targetLabel = typeof payload.targetLabel === 'string' ? payload.targetLabel.slice(0, 200) : ''; status = paused ? '电脑已暂停' : '已安全连接'; }
-     else if (payload.kind === 'ack' && pending && payload.id === pending.id) { clearTimeout(pending.timer); pending = undefined; result = payload.status === 'injected' ? '已输入到电脑。请在目标应用检查内容；这不代表文件已保存。草稿已保留。' : payload.status === 'rejected' ? '电脑拒绝了这次输入（可能已暂停、过期或焦点不安全）。草稿已保留。' : '结果未知，请检查电脑后再决定是否手动发送。草稿已保留。'; }
+     else if (payload.kind === 'ack' && pending && payload.id === pending.id) { clearTimeout(pending.timer); pending = undefined; result = ackMessage(payload.status, payload.code); }
     } else if (message.type === 'pair-rejected' || message.type === 'peer-revoked') { device.enabled = false; device.approved = false; save(); stop(); status = '配对已拒绝或撤销 · 请重新扫码'; }
     else if (message.type === 'error') {
      unknown();
@@ -126,15 +131,19 @@ $('pair').onclick = async () => {
  finally { pairingBusy = false; update(); }
 };
 $('send').onclick = () => {
- if ($<HTMLButtonElement>('send').disabled || !active || !socket || socket.readyState !== WebSocket.OPEN) return;
+ update();
+ if ($<HTMLButtonElement>('send').disabled || !active || !socket || socket.readyState !== WebSocket.OPEN) { result = '本次未发送。' + $('send-hint').textContent; update(); return; }
  const id = crypto.randomUUID(); const now = Date.now();
+ $('result-label').textContent = `第 ${++sendCount} 次发送 · ${new Date(now).toLocaleTimeString('zh-CN', { hour12: false })}`;
  try {
   const envelope = seal({ kind: 'text', id, sessionId, text: draft.value, sentAt: now, expiresAt: now + 15000 }, { roomId: active.roomId, sender: active.deviceId, recipient: 'owner' }, active.ownerPublicKey, active.secretKey);
-  pending = { id, timer: setTimeout(() => { unknown(); update(); }, 15000) };
-  socket.send(JSON.stringify({ type: 'relay', to: 'owner', envelope })); result = '已发出密文，等待电脑确认…';
+  pending = { id, startedAt: now, timer: setTimeout(() => { unknown('timeout'); update(); }, 15000) };
+  socket.send(JSON.stringify({ type: 'relay', to: 'owner', envelope })); result = '本次已发出密文，正在等待电脑确认（最多 15 秒）。尚不能确定目标应用是否收到文字。';
  } catch { unknown(); result = '发送结果未知，请检查电脑。草稿已保留，不会自动重试。'; }
  update();
 };
+// Only redraw the countdown; never resend or persist the draft.
+setInterval(() => { if (pending) update(); }, 1000);
 draft.oninput = update;
 $('clear').onclick = () => { if (draft.value && confirm('清空当前草稿？此操作无法撤销。')) { draft.value = ''; update(); draft.focus(); } };
 $('connect').onclick = () => { if (!active) return; active.enabled = !active.enabled; save(); if (active.enabled) { attempts = 0; connect(); } else { stop(); status = '已手动断开 · 不会自动重连'; update(); } };
