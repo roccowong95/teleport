@@ -32,6 +32,7 @@ export class Receiver extends EventEmitter {
   }
   connect({ retry = false } = {}) {
     if (retry && this.stopped) return;
+    this.paused = true; // Every new transport session requires explicit local resume.
     if (!retry) { this.stopped = false; this.retryAttempt = 0; }
     if (!this.state) throw new Error('Not configured');
     this.socket?.close(); clearTimeout(this.retry); const generation = this.generation = (this.generation || 0) + 1;
@@ -46,7 +47,7 @@ export class Receiver extends EventEmitter {
     socket.on('close', () => { if (generation !== this.generation) return; this.connected = false; this.online.clear(); this.pending.clear(); this.changed(); if (!this.stopped) { const delay = Math.min(30000, 1000 * 2 ** Math.min(this.retryAttempt || 0, 5)); this.retryAttempt = (this.retryAttempt || 0) + 1; this.retry = setTimeout(() => this.connect({retry:true}), delay); } });
     this.changed();
   }
-  stop() { this.stopped = true; clearTimeout(this.retry); this.generation++; this.socket?.close(); this.connected = false; this.online.clear(); this.pending.clear(); this.changed(); }
+  stop() { this.paused = true; this.stopped = true; clearTimeout(this.retry); this.generation++; this.socket?.close(); this.connected = false; this.online.clear(); this.pending.clear(); this.changed(); }
   send(value) { if (this.socket?.readyState !== 1) throw new Error('relay_offline'); this.socket.send(JSON.stringify(value)); }
   async encrypted(deviceId, payload) { const peer = this.state.peers[deviceId]; if (!peer) return; const envelope = await seal(payload, {roomId:this.state.roomId,sender:'owner',recipient:deviceId}, peer.publicKey, this.state.secretKey); this.send({type:'relay',to:deviceId,envelope}); }
   ready(deviceId) { return this.encrypted(deviceId, {kind:'ready',sessionId:this.sessionId,targetLabel:this.adapter.label,paused:this.paused}); }

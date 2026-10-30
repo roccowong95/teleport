@@ -17,3 +17,25 @@ window.teleport.on('status',render); window.teleport.on('notice',message=>{ $('n
 window.teleport.on('pair-request',request=>{ pending=request; $('phoneName').textContent=request.name; $('sas').textContent=request.sas; $('approval').hidden=false; $('qr').hidden=true; });
 for (const [button,confirmed] of [['approve',true],['reject',false]]) $(button).onclick=()=>action(async()=>{ if (!pending) return; await window.teleport.approve(pending.deviceId,confirmed); pending=null; $('approval').hidden=true; });
 window.teleport.status().then(render);
+
+function renderPermissions(value) {
+  $('permissions').hidden = !value.supported;
+  const label = status => status === 'denied' ? 'Not granted (denied)' : status;
+  $('permissionStatus').textContent = `Accessibility: ${label(value.accessibility)}. Event posting: ${label(value.postEvent)}.`;
+  $('permissionError').textContent = value.error || '';
+}
+let permissionActionPending = false;
+async function permissionAction(kind) {
+  if (permissionActionPending) return;
+  permissionActionPending = true;
+  for (const id of ['checkPermissions','requestAccessibility','requestPostEvent']) $(id).disabled = true;
+  try { renderPermissions(kind ? await window.teleport.permissionsRequest(kind) : await window.teleport.permissionsCheck()); }
+  catch { renderPermissions({supported:true,accessibility:'unknown',postEvent:'unknown',error:'Could not determine permissions (unknown, not a denial). Review macOS settings and recheck; input has not been enabled.'}); }
+  finally { permissionActionPending = false; for (const id of ['checkPermissions','requestAccessibility','requestPostEvent']) $(id).disabled = false; }
+}
+$('checkPermissions').onclick = () => permissionAction();
+$('requestAccessibility').onclick = () => permissionAction('accessibility');
+$('requestPostEvent').onclick = () => permissionAction('postEvent');
+window.teleport.on('permissions',renderPermissions);
+// Read-only status check; permission requests require explicit button clicks.
+const initialPermissionCheck = permissionAction();

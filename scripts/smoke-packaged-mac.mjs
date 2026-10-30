@@ -15,6 +15,6 @@ try{
  const result=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve({code,signal}));}).finally(()=>{clearTimeout(timer);clearTimeout(killTimer);});
  if(timedOut||result.code!==0)throw Error(`Packaged app failed: timeout=${timedOut}, exit=${result.code}, signal=${result.signal}\n${stdout}\n${stderr}`);
  const marker=JSON.parse(await readFile(join(directory,'smoke-result.json'),'utf8'));
- if(marker.ready!==true||marker.renderer!==true)throw Error('App did not confirm main + renderer startup');
- console.log('Packaged macOS app: main and sandboxed renderer startup confirmed. No network/input/Accessibility acceptance claimed.');
+ if(marker.ready!==true||marker.renderer!==true||marker.permissions!==true)throw Error('App did not confirm main + renderer startup + read-only permission IPC');
+ console.log('Packaged macOS app: main, sandboxed renderer and read-only permission IPC confirmed. No network/input/permission request or grant claimed.');
 }finally{await rm(directory,{recursive:true,force:true});}

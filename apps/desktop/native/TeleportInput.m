@@ -1,4 +1,4 @@
-// macOS-only. No clipboard, shell commands, synthetic Return or permission changes.
+// macOS-only. No clipboard, shell commands or synthetic Return. Permission requests require explicit CLI modes.
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include <stdio.h>
@@ -34,12 +34,32 @@ static AXUIElementRef CopySafeFocus(pid_t *pid) {
     return element;
 }
 
+// These APIs report current authorization, not whether a prompt was displayed.
+// AX prompting is asynchronous: requesting must never be treated as granting access.
+static void PrintPermissions(void) {
+    printf("{\"accessibility\":\"%s\",\"postEvent\":\"%s\"}\n",
+        AXIsProcessTrusted() ? "granted" : "denied",
+        CGPreflightPostEventAccess() ? "granted" : "denied");
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && strcmp(argv[1], "--check-access") == 0) {
             BOOL ready = AXIsProcessTrusted() && CGPreflightPostEventAccess();
             puts(ready ? "access_available" : "access_required");
             return ready ? 0 : 2; // Checks only; never prompts or changes system permission.
+        }
+        if (argc == 2 && strcmp(argv[1], "--permissions") == 0) {
+            PrintPermissions(); return 0; // Read-only; never prompts.
+        }
+        if (argc == 2 && strcmp(argv[1], "--request-accessibility") == 0) {
+            NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
+            (void)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+            PrintPermissions(); return 0;
+        }
+        if (argc == 2 && strcmp(argv[1], "--request-post-event") == 0) {
+            (void)CGRequestPostEventAccess();
+            PrintPermissions(); return 0;
         }
         if (argc != 1) return 1;
         unsigned char bytes[8193];

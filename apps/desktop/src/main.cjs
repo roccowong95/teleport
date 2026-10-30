@@ -28,7 +28,41 @@ else app.whenReady().then(async () => {
   if (icon.isEmpty()) throw new Error('Tray image could not be decoded');
   if (process.platform === 'darwin') icon.setTemplateImage(true);
   tray = new Tray(icon); tray.setTitle('⇥'); tray.setToolTip('Teleport — paused');
-  const updateMenu = () => { tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Teleport',click:show},{label:receiver.paused?'Resume input':'Pause input',click:() => receiver.pause(!receiver.paused).catch(() => {})},{label:receiver.stopped?'Connect to relay':'Disconnect from relay',enabled:!!receiver.state,click:() => receiver.stopped ? receiver.connect() : receiver.stop()},{type:'separator'},{label:'Quit',click:() => app.quit()}])); tray.setToolTip(`Teleport — ${receiver.paused?'paused':'ready'}`); };
+  const hasMacPermissions = receiver.adapter instanceof MacAdapter;
+  const permissionValue = value => ['granted','denied','unknown'].includes(value) ? value : 'unknown';
+  const reportPermissions = result => {
+    const state = {supported:hasMacPermissions,accessibility:permissionValue(result?.accessibility),postEvent:permissionValue(result?.postEvent),...(result?.error ? {error:String(result.error).slice(0,240)} : {})};
+    window.webContents.send('permissions',state);
+    return state;
+  };
+  const checkPermissions = async () => {
+    if (!hasMacPermissions) return reportPermissions({});
+    try { return reportPermissions(await receiver.adapter.checkPermissions()); }
+    catch { return reportPermissions({error:'Unable to check the native helper permissions. Build/install the helper and recheck.'}); }
+  };
+  const setPaused = async paused => {
+    if (!paused) {
+      const sessionId = receiver.sessionId;
+      if (hasMacPermissions) {
+        const permissions = await checkPermissions();
+        if (permissions.accessibility !== 'granted' || permissions.postEvent !== 'granted') {
+          await receiver.pause(true);
+          window.webContents.send('notice','Input remains paused. Accessibility and event-posting permission must both be granted. Use the permission controls below, then recheck.');
+          show(); return false;
+        }
+      }
+      if (!receiver.connected || sessionId !== receiver.sessionId) {
+        window.webContents.send('notice','Input remains paused. Connect to the relay, then explicitly resume.');
+        return false;
+      }
+    }
+    await receiver.pause(paused); return true;
+  };
+  const setConnected = async connected => {
+    if (connected) { await receiver.pause(true); receiver.connect(); }
+    else { receiver.stop(); await receiver.pause(true); }
+  };
+  const updateMenu = () => { tray.setContextMenu(Menu.buildFromTemplate([{label:'Open Teleport',click:show},{label:receiver.paused?'Resume input':'Pause input',enabled:!!receiver.state,click:() => setPaused(!receiver.paused).catch(() => window.webContents.send('notice','Input state could not be changed. Recheck the connection.'))},{label:receiver.stopped?'Connect to relay':'Disconnect from relay',enabled:!!receiver.state,click:() => setConnected(!!receiver.stopped).catch(() => window.webContents.send('notice','Relay connection failed. Saved credentials were not changed.'))},{type:'separator'},{label:'Quit',click:() => app.quit()}])); tray.setToolTip(`Teleport — ${receiver.paused?'paused':'ready'}`); };
   tray.on('click',show); updateMenu();
   receiver.on('status', state => { window.webContents.send('status',state); updateMenu(); });
   receiver.on('notice', message => window.webContents.send('notice',message));
@@ -40,25 +74,43 @@ else app.whenReady().then(async () => {
     return callback(event, ...args);
   });
   handle('status', () => receiver.status());
+  handle('permissions-check', () => checkPermissions());
+  handle('permissions-request', async (_, kind) => {
+    if (!['accessibility','postEvent'].includes(kind)) throw new Error('Invalid permission kind');
+    if (!hasMacPermissions) return reportPermissions({});
+    // Only this explicit renderer action may invoke an OS permission request.
+    try { return reportPermissions(await receiver.adapter.requestPermission(kind)); }
+    catch { return reportPermissions({error:'Permission request failed. Review macOS System Settings, then recheck.'}); }
+  });
   handle('setup', (_, value) => receiver.setup(value.endpoint,value.name));
   handle('pairing', async () => { const result = await receiver.pairing(); return {...result, qr:await QRCode.toDataURL(result.url)}; });
   handle('approve', (_, id, confirmed) => receiver.approve(String(id),confirmed === true));
-  handle('connection', (_, connected) => { if (connected === true) receiver.connect(); else receiver.stop(); });
-  handle('pause', (_, paused) => receiver.pause(paused === true));
+  handle('connection', (_, connected) => setConnected(connected === true));
+  handle('pause', (_, paused) => setPaused(paused === true));
   handle('revoke', (_, id) => receiver.revoke(String(id)));
   handle('reset', async () => { const result = await dialog.showMessageBox(window, {type:'warning',buttons:['Cancel','Delete room and reset'],defaultId:0,cancelId:0,message:'Delete this room and all paired phones?',detail:'This removes this computer’s saved identity. You must pair again after setup.'}); if (result.response === 1) await receiver.reset(); });
   await window.loadFile(path.join(__dirname,'index.html'));
   if (smokeDir) {
     // Exercise the real sandboxed renderer/preload and trusted IPC, not native input.
     const renderer = await window.webContents.executeJavaScript(`(async () => {
+      await initialPermissionCheck;
       const state = await window.teleport.status();
-      return document.querySelector('h1')?.textContent === 'Teleport' && state.configured === false && state.paused === true;
+      const permissions = await window.teleport.permissionsCheck();
+      // UI fixtures only: denied/unknown remain usable, never auto-request/resume.
+      renderPermissions({supported:true,accessibility:'denied',postEvent:'unknown'});
+      const permissionUI = !document.querySelector('#permissions').hidden && document.querySelector('#permissionStatus').textContent.includes('denied') && document.querySelector('#permissionStatus').textContent.includes('unknown');
+      renderPermissions(permissions);
+      return document.querySelector('h1')?.textContent === 'Teleport' && state.configured === false && state.paused === true && permissionUI && typeof permissions.supported === 'boolean' && ['granted','denied','unknown'].includes(permissions.accessibility) && ['granted','denied','unknown'].includes(permissions.postEvent);
     })()`);
     if (!renderer) throw new Error('Packaged renderer smoke failed');
-    await require('node:fs/promises').writeFile(path.join(smokeDir,'smoke-result.json'), JSON.stringify({ready:true,renderer:true}));
+    await require('node:fs/promises').writeFile(path.join(smokeDir,'smoke-result.json'), JSON.stringify({ready:true,renderer:true,permissions:true,permissionsCheck:true,permissionRequests:false}));
     app.quit(); return;
   }
-  try { await receiver.initialize(); if (receiver.state) receiver.connect(); } catch { await dialog.showMessageBox(window,{type:'error',message:'Secure credential storage unavailable or unreadable. Teleport is stopped. Enable your OS keychain and relaunch.'}); app.quit(); return; }
+  try { await receiver.initialize(); } catch { await dialog.showMessageBox(window,{type:'error',message:'Secure credential storage unavailable or unreadable. Teleport is stopped. Enable your OS keychain and relaunch.'}); app.quit(); return; }
+  if (receiver.state) {
+    try { await setConnected(true); }
+    catch { receiver.stop(); window.webContents.send('notice','Relay connection failed. Saved credentials are intact. Check the relay and try Connect to relay again.'); }
+  }
   show();
 }).catch(error => {
   console.error('Teleport startup failed:', error.message);

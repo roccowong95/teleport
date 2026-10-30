@@ -11,6 +11,34 @@ function run(command, args, input, spawnImpl = spawn) {
     child.stdin.on('error', () => {}); child.stdin.end(input);
   });
 }
+const unknownPermissions = error => ({ accessibility: 'unknown', postEvent: 'unknown', error });
+function permissionStatus(command, args, spawnImpl, timeoutMs) {
+  return new Promise(resolve => {
+    let child, timer, output = '', settled = false;
+    const finish = result => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    try { child = spawnImpl(command, args, { stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true }); }
+    catch { finish(unknownPermissions('permission_helper_unavailable')); return; }
+    // Requests have a generous deadline for OS dialogs; timeout is UNKNOWN, never denial.
+    timer = setTimeout(() => { finish(unknownPermissions('permission_check_timeout')); child.kill(); }, timeoutMs);
+    child.stdout.on('data', data => {
+      if (settled) return;
+      output += data.toString();
+      if (output.length > 4096) { finish(unknownPermissions('invalid_permission_response')); child.kill(); }
+    });
+    child.stderr.on('data', () => {});
+    child.on('error', () => finish(unknownPermissions('permission_helper_unavailable')));
+    child.on('close', code => {
+      if (code !== 0) { finish(unknownPermissions('permission_helper_failed')); return; }
+      try {
+        const result = JSON.parse(output);
+        const valid = value => ['granted', 'denied', 'unknown'].includes(value);
+        if (!result || !valid(result.accessibility) || !valid(result.postEvent)) throw Error('invalid');
+        finish({accessibility:result.accessibility, postEvent:result.postEvent});
+      } catch { finish(unknownPermissions('invalid_permission_response')); }
+    });
+    child.stdin.on('error', () => {}); child.stdin.end('');
+  });
+}
 export class DryRunAdapter {
   label = 'Dry run — no OS input';
   constructor(onText = () => {}) { this.onText = onText; }
@@ -18,8 +46,14 @@ export class DryRunAdapter {
 }
 export class MacAdapter {
   label = 'Focused editable field (macOS)';
-  constructor(helper = fileURLToPath(new URL('../native/teleport-input', import.meta.url))) { this.helper = helper; }
-  async inject(text) { await run(this.helper, [], text); return { status: 'injected' }; }
+  constructor(helper = fileURLToPath(new URL('../native/teleport-input', import.meta.url)), {spawnImpl = spawn, permissionCheckTimeoutMs = 5000, permissionRequestTimeoutMs = 120000} = {}) { Object.assign(this, {helper, spawnImpl, permissionCheckTimeoutMs, permissionRequestTimeoutMs}); }
+  async inject(text) { await run(this.helper, [], text, this.spawnImpl); return { status: 'injected' }; }
+  async checkPermissions() { return permissionStatus(this.helper, ['--permissions'], this.spawnImpl, this.permissionCheckTimeoutMs); }
+  async requestPermission(kind) {
+    const flag = kind === 'accessibility' ? '--request-accessibility' : kind === 'postEvent' ? '--request-post-event' : null;
+    if (!flag) return unknownPermissions('invalid_permission_kind');
+    return permissionStatus(this.helper, [flag], this.spawnImpl, this.permissionRequestTimeoutMs);
+  }
 }
 export class WindowsAdapter {
   label = 'Focused editable field (Windows preview)';
