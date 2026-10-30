@@ -33,3 +33,7 @@ After ordinary CI is reviewed, the authorized one-shot request may add/change `.
 Only that file changing in a main push activates the request. Every test/build runs again, and the exact passing commit becomes the immutable tag target. Later unrelated pushes do not publish again. Existing tags/releases/assets are never overwritten. Future `v0.2.*` prerelease tags belong only to this lightweight workflow; the legacy workflow is restricted to `v0.1.*` tags and ignores Windows-only source changes. Shared source/dependency changes still get legacy checks.
 
 Only the release job has `contents: write`; no Cloudflare deployment, signing credential, paid larger runner, offline browser runtime or automatic updater is configured. Assets are the Windows-only ZIP, measured-size JSON manifest and `SHA256SUMS.txt`. macOS alpha artifacts are not replaced by this release.
+
+## Stop behavior
+
+Pause/disconnect/revoke/reset signal the active native operation before waiting for the controller/network. New text is blocked while that emergency stop is pending. Each native Unicode chunk and its immediate `SendInput` boundary checks the per-operation cancellation flag. Cancellation is reported as unknown, never retried. Windows input events already posted cannot be recalled; focus/cancellation checks and event posting cannot form an atomic OS transaction. This is not a hard real-time emergency-stop guarantee.

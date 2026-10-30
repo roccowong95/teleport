@@ -2,6 +2,12 @@
 //! target-text reads, synthesized Return, or automatic retry. Success means events
 //! were posted, never that the target application saved/accepted them.
 
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+fn ensure_active(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) { Err("input_cancelled".into()) } else { Ok(()) }
+}
+
 fn validate_text(text: &str) -> Result<(), String> {
     if text.is_empty() || text.len() > 8192 {
         return Err("input_size_refused".into());
@@ -30,17 +36,24 @@ fn unicode_chunks(text: &str) -> Vec<Vec<u16>> {
 }
 
 pub fn inject(text: &str) -> Result<(), String> {
+    inject_cancellable(text, Arc::new(AtomicBool::new(false)))
+}
+
+/// Cancellation stops future chunks; it cannot retract events already queued by Windows.
+/// Use a fresh token per injection. Never clear/reuse a cancelled token.
+pub fn inject_cancellable(text: &str, cancel: Arc<AtomicBool>) -> Result<(), String> {
+    ensure_active(&cancel)?;
     validate_text(text)?;
     #[cfg(windows)]
-    { native::inject(text) }
+    { native::inject(text, cancel) }
     #[cfg(not(windows))]
     { let _ = text; Err("windows_input_unavailable".into()) }
 }
 
 #[cfg(windows)]
 mod native {
-    use super::unicode_chunks;
-    use std::{ffi::c_void, mem::size_of, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}};
+    use super::{unicode_chunks, ensure_active};
+    use std::{ffi::c_void, mem::size_of, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
     use windows::{core::Interface, Win32::{
         Foundation::{CloseHandle, HANDLE, HWND},
         Security::{GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY},
@@ -176,7 +189,8 @@ mod native {
         Ok(Focus { hwnd, pid, runtime_id })
     }
 
-    unsafe fn run(text: &str) -> Result<()> {
+    unsafe fn run(text: &str, cancel: &AtomicBool) -> Result<()> {
+        ensure_active(cancel)?;
         CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(err)?;
         let _apartment = Apartment;
         let automation: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).map_err(err)?;
@@ -187,6 +201,7 @@ mod native {
         let deadline = Instant::now() + Duration::from_secs(3);
         let initial = focus(&automation)?;
         for chunk in unicode_chunks(text) {
+            ensure_active(cancel)?;
             let current = focus(&automation)?;
             require(current.hwnd == initial.hwnd && current.pid == initial.pid && current.runtime_id == initial.runtime_id)?;
             if Instant::now() >= deadline { return Err("input_deadline_exceeded".into()); }
@@ -202,6 +217,7 @@ mod native {
             }
             // The final focus check and OS event delivery cannot be made atomic.
             // A partial count is unknown; never retry this text automatically.
+            ensure_active(cancel)?;
             if SendInput(&events, size_of::<INPUT>() as i32) != events.len() as u32 {
                 return Err("input_posting_unconfirmed".into());
             }
@@ -209,7 +225,8 @@ mod native {
         Ok(())
     }
 
-    pub(super) fn inject(text: &str) -> Result<()> {
+    pub(super) fn inject(text: &str, cancel: Arc<AtomicBool>) -> Result<()> {
+        ensure_active(&cancel)?;
         if BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return Err("input_busy".into());
         }
@@ -218,7 +235,7 @@ mod native {
         // Caller must not run this blocking function on the GUI event loop.
         let worker = std::thread::Builder::new().name("teleport-input".into()).spawn(move || {
             let _busy = BusyGuard;
-            unsafe { run(&text) }
+            unsafe { run(&text, &cancel) }
         });
         match worker {
             Ok(worker) => worker.join().unwrap_or_else(|_| Err("input_worker_failed".into())),
@@ -246,6 +263,19 @@ mod tests {
         let chunks = unicode_chunks(&text);
         assert!(chunks.iter().all(|chunk| chunk.len() <= 20 && String::from_utf16(chunk).is_ok()));
         assert_eq!(String::from_utf16(&chunks.concat()).unwrap(), text);
+    }
+    #[test] fn already_cancelled_refuses_before_platform_work() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert_eq!(inject_cancellable("harmless", cancel), Err("input_cancelled".into()));
+    }
+    #[test] fn cancellation_is_observed_between_chunks() {
+        let cancel = AtomicBool::new(false);
+        let mut chunks = unicode_chunks(&"x".repeat(60)).into_iter();
+        assert!(ensure_active(&cancel).is_ok());
+        assert!(chunks.next().is_some());
+        cancel.store(true, Ordering::Release);
+        assert_eq!(ensure_active(&cancel), Err("input_cancelled".into()));
+        assert!(chunks.next().is_some()); // Remaining data exists, but must not be posted.
     }
     #[cfg(windows)]
     #[test] fn official_input_union_has_platform_layout() {

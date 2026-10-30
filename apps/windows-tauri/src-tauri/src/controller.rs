@@ -3,7 +3,7 @@
 use crate::{input, protocol, store};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle, time::{Duration, Instant}};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -38,13 +38,54 @@ fn validate_state(state: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// A short non-async lock protects cancellation token installation and resume epochs.
+// Emergency calls cancel before waiting for the actor queue (including blocked HTTP).
+struct Safety {
+    emergency: AtomicBool,
+    epoch: AtomicU64,
+    transport: AtomicU64,
+    active: Mutex<Option<Arc<AtomicBool>>>,
+}
+impl Safety {
+    fn new() -> Self { Self {emergency:AtomicBool::new(true),epoch:AtomicU64::new(0),transport:AtomicU64::new(0),active:Mutex::new(None)} }
+    fn cancel(&self) {
+        let active=self.active.lock().unwrap_or_else(|e|e.into_inner());
+        self.epoch.fetch_add(1,Ordering::SeqCst); self.emergency.store(true,Ordering::SeqCst);
+        if let Some(token)=active.as_ref() { token.store(true,Ordering::Release); }
+    }
+    fn cancel_transport(&self, generation:u64) {
+        let active=self.active.lock().unwrap_or_else(|e|e.into_inner());
+        if self.transport.load(Ordering::SeqCst)!=generation { return; }
+        self.epoch.fetch_add(1,Ordering::SeqCst); self.emergency.store(true,Ordering::SeqCst);
+        if let Some(token)=active.as_ref() { token.store(true,Ordering::Release); }
+    }
+    fn resume(&self, expected:u64) -> Result<(),String> {
+        let active=self.active.lock().unwrap_or_else(|e|e.into_inner());
+        if active.is_some() { return Err("input_busy".into()); }
+        if self.epoch.load(Ordering::SeqCst)!=expected { return Err("newer_stop_requested".into()); }
+        self.emergency.store(false,Ordering::SeqCst); Ok(())
+    }
+    fn begin(&self) -> Result<Arc<AtomicBool>,String> {
+        let mut active=self.active.lock().unwrap_or_else(|e|e.into_inner());
+        if self.emergency.load(Ordering::SeqCst) { return Err("paused".into()); }
+        if active.is_some() { return Err("input_busy".into()); }
+        let token=Arc::new(AtomicBool::new(false)); *active=Some(token.clone()); Ok(token)
+    }
+    fn finish(&self, token:&Arc<AtomicBool>) {
+        let mut active=self.active.lock().unwrap_or_else(|e|e.into_inner());
+        if active.as_ref().is_some_and(|current|Arc::ptr_eq(current,token)) { *active=None; }
+    }
+}
 #[derive(Clone)]
-pub struct Handle { commands: mpsc::Sender<Command> }
-struct Command { name: String, args: Value, reply: oneshot::Sender<Result<Value, String>> }
+pub struct Handle { commands: mpsc::Sender<Command>, safety: Arc<Safety> }
+struct Command { name: String, args: Value, epoch: u64, reply: oneshot::Sender<Result<Value, String>> }
+
 impl Handle {
     pub async fn call(&self, cmd: &str, args: Value) -> Result<Value, String> {
+        if matches!(cmd,"disconnect"|"stop"|"revoke"|"reset") || (cmd=="pause" && args["paused"]==true) { self.safety.cancel(); }
+        let epoch=self.safety.epoch.load(Ordering::SeqCst);
         let (reply, answer) = oneshot::channel();
-        self.commands.send(Command {name: cmd.into(), args, reply}).await.map_err(|_| "controller_stopped")?;
+        self.commands.send(Command {name: cmd.into(), args, epoch, reply}).await.map_err(|_| "controller_stopped")?;
         answer.await.map_err(|_| "controller_stopped".to_owned())?
     }
 }
@@ -57,17 +98,19 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
         .timeout(Duration::from_secs(10)).build().map_err(|_| "http_initialization_failed")?;
     let (commands, rx) = mpsc::channel(32);
     let (events, event_rx) = mpsc::channel(32);
-    let actor = Actor {path, emit, state, http, commands: rx, events, event_rx,
+    let safety=Arc::new(Safety::new());
+    let actor = Actor {safety:safety.clone(),path, emit, state, http, commands: rx, events, event_rx,
         transport: None, outbound: None, generation: 0, connected: false, stopped: false,
         paused: true, retry: None, attempts: 0, session: Uuid::new_v4().to_string(),
         pending: HashMap::new(), online: HashSet::new(), gate: Gate::default(), injecting: false};
     tokio::spawn(actor.run());
-    Ok(Handle {commands})
+    Ok(Handle {commands,safety})
 }
 
 struct Pending { public_key: String, name: String, expires: u64, confirmed: bool }
-enum Event { Frame(u64, Value), Closed(u64), Injected { generation: u64, device_id: String, message_id: String, success: bool } }
+enum Event { Frame(u64, Value), Closed(u64), Injected { generation: u64, device_id: String, message_id: String, success: bool, token: Arc<AtomicBool> } }
 struct Actor {
+    safety: Arc<Safety>,
     path: PathBuf, emit: Emit, state: Option<Value>, http: reqwest::Client,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>, event_rx: mpsc::Receiver<Event>,
     transport: Option<JoinHandle<()>>, outbound: Option<mpsc::Sender<Value>>, generation: u64,
@@ -83,7 +126,7 @@ impl Actor {
             tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { self.stop(); break; };
-                    let result = self.command(&command.name, command.args).await;
+                    let result = self.command_at(&command.name, command.args, command.epoch).await;
                     let _ = command.reply.send(result);
                 }
                 event = self.event_rx.recv() => if let Some(event) = event {
@@ -92,7 +135,9 @@ impl Actor {
                             if self.receive(message).await.is_err() { (self.emit)("notice", json!("Message refused or connection error.")); }
                         }
                         Event::Closed(generation) if generation == self.generation => self.disconnected(),
-                        Event::Injected {generation, device_id, message_id, success} => {
+                        Event::Injected {generation, device_id, message_id, success, token} => {
+                            self.safety.finish(&token);
+                            let success=success && !token.load(Ordering::Acquire);
                             self.injecting = false;
                             if generation == self.generation && self.online.contains(&device_id) {
                                 let ack = if success { json!({"kind":"ack","id":message_id,"status":"injected"}) }
@@ -111,12 +156,14 @@ impl Actor {
     fn status(&self) -> Value {
         let devices = self.state.as_ref().and_then(|s| s["peers"].as_object()).map(|peers| peers.iter().map(|(id,p)| json!({"deviceId":id,"name":p["name"],"online":self.online.contains(id)})).collect::<Vec<_>>()).unwrap_or_default();
         json!({"configured":self.state.is_some(),"disconnected":self.stopped,"connected":self.connected,
-            "paused":self.paused,"name":self.state.as_ref().map(|s| &s["name"]),
+            "paused":self.paused || self.safety.emergency.load(Ordering::SeqCst),"name":self.state.as_ref().map(|s| &s["name"]),
             "endpoint":self.state.as_ref().map(|s| &s["endpoint"]),"targetLabel":TARGET,"devices":devices})
     }
     fn changed(&self) { (self.emit)("status", self.status()); }
     fn stop(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.safety.transport.store(self.generation,Ordering::SeqCst);
+        self.safety.cancel();
         if let Some(task) = self.transport.take() { task.abort(); }
         self.outbound = None; self.connected = false; self.paused = true; self.stopped = true;
         self.retry = None; self.pending.clear(); self.online.clear(); self.changed();
@@ -132,14 +179,16 @@ impl Actor {
         let token = token.to_owned();
         self.session = Uuid::new_v4().to_string(); self.gate = Gate::default();
         let (outbound, rx) = mpsc::channel(16); self.outbound = Some(outbound);
-        let events = self.events.clone(); let generation = self.generation;
+        let events = self.events.clone(); let generation = self.generation; let safety=self.safety.clone();
         self.transport = Some(tokio::spawn(async move {
-            let _ = transport(url.to_string(), token, generation, rx, events.clone()).await;
+            let _ = transport(url.to_string(), token, generation, rx, events.clone(),safety.clone()).await;
+            safety.cancel_transport(generation);
             let _ = events.send(Event::Closed(generation)).await;
         }));
         self.changed();
     }
     fn disconnected(&mut self) {
+        self.safety.cancel();
         self.connected = false; self.paused = true; self.online.clear(); self.pending.clear(); self.outbound = None;
         if let Some(task) = self.transport.take() { task.abort(); }
         if !self.stopped {
@@ -160,7 +209,7 @@ impl Actor {
         self.send(json!({"type":"relay","to":id,"envelope":envelope}))
     }
     fn ready(&self, id: &str) -> Result<(), String> {
-        self.encrypted(id,json!({"kind":"ready","sessionId":self.session,"targetLabel":TARGET,"paused":self.paused}))
+        self.encrypted(id,json!({"kind":"ready","sessionId":self.session,"targetLabel":TARGET,"paused":self.paused || self.safety.emergency.load(Ordering::SeqCst)}))
     }
     async fn request_for(&self, state: &Value, suffix: &str, method: reqwest::Method, body: Option<Value>) -> Result<Value,String> {
         let url = format!("{}/api/rooms{}",string(state,"endpoint")?,suffix);
@@ -176,7 +225,11 @@ impl Actor {
         }
         serde_json::from_slice(&bytes).map_err(|_| "invalid_relay_response".into())
     }
+    #[cfg(test)]
     async fn command(&mut self, command: &str, args: Value) -> Result<Value,String> {
+        self.command_at(command,args,self.safety.epoch.load(Ordering::SeqCst)).await
+    }
+    async fn command_at(&mut self, command: &str, args: Value, epoch:u64) -> Result<Value,String> {
         match command {
             "status" => return Ok(self.status()),
             "setup" => {
@@ -200,6 +253,8 @@ impl Actor {
             "pause" => {
                 let paused = args["paused"].as_bool().ok_or("invalid_paused")?;
                 if !paused && !self.connected { return Err("relay_offline".into()); }
+                if paused { self.safety.cancel(); }
+                else { if self.injecting { return Err("input_busy".into()); } self.safety.resume(epoch)?; }
                 self.paused = paused;
                 for id in &self.online { let _ = self.ready(id); }
             }
@@ -228,6 +283,8 @@ impl Actor {
                 }
             }
             "revoke" => {
+                self.safety.cancel(); self.paused=true;
+                for id in &self.online { let _=self.ready(id); }
                 let id = string(&args,"deviceId")?; Uuid::parse_str(id).map_err(|_| "invalid_device")?;
                 let state = self.state()?;
                 let result = self.request_for(state,&format!("/{}/devices/{id}",string(state,"roomId")?),reqwest::Method::DELETE,None).await;
@@ -238,6 +295,7 @@ impl Actor {
                 if let Err(error) = store::save(&self.path,&state) { self.stop(); return Err(error); }
             }
             "reset" => {
+                self.safety.cancel(); self.paused=true;
                 if args["confirmed"] != true { return Err("confirmation_required".into()); }
                 if let Some(state) = self.state.as_ref() {
                     let result = self.request_for(state,&format!("/{}",string(state,"roomId")?),reqwest::Method::DELETE,None).await;
@@ -282,6 +340,7 @@ impl Actor {
             }
             "peer-offline" => { self.online.remove(string(&message,"deviceId")?); }
             "peer-revoked" => {
+                self.safety.cancel(); self.paused=true;
                 let id = string(&message,"deviceId")?; let mut state = self.state()?.clone();
                 state["peers"].as_object_mut().ok_or("invalid_peers")?.remove(id);
                 self.online.remove(id); self.pending.remove(id); self.state = Some(state.clone());
@@ -306,7 +365,7 @@ impl Actor {
         let context = json!({"roomId":state["roomId"],"sender":id,"recipient":"owner"});
         let payload = protocol::open(&message["envelope"],&context,string(peer,"publicKey")?,string(state,"secretKey")?)?;
         let authorized = self.online.contains(id) && self.state()?.get("peers").and_then(|p| p.get(id)).is_some();
-        if let Err(code) = self.gate.accept(&payload,&self.session,now(),self.paused,authorized) {
+        if let Err(code) = self.gate.accept(&payload,&self.session,now(),self.paused || self.safety.emergency.load(Ordering::SeqCst),authorized) {
             if let Some(message_id) = payload["id"].as_str().filter(|id| id.len() <= 64) {
                 self.encrypted(id,json!({"kind":"ack","id":message_id,"status":"rejected","code":code}))?;
             }
@@ -316,6 +375,10 @@ impl Actor {
             self.encrypted(id,json!({"kind":"ack","id":payload["id"],"status":"rejected","code":"input_busy"}))?;
             return Ok(());
         }
+        let token=match self.safety.begin() {
+            Ok(token)=>token,
+            Err(code)=> { self.encrypted(id,json!({"kind":"ack","id":payload["id"],"status":"rejected","code":code}))?; return Ok(()); }
+        };
         let text = string(&payload,"text")?.to_owned();
         let device_id = id.to_owned(); let message_id = string(&payload,"id")?.to_owned();
         let events = self.events.clone(); let generation = self.generation;
@@ -324,15 +387,16 @@ impl Actor {
         // Already-posted OS events cannot be undone. Never run a second injection until
         // the native call really returns: dropping a timed-out blocking task cannot stop it.
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || input::inject(&text)).await;
-            let _ = events.send(Event::Injected {generation,device_id,message_id,success:matches!(result,Ok(Ok(())))}).await;
+            let native_token=token.clone();
+            let result = tokio::task::spawn_blocking(move || input::inject_cancellable(&text,native_token)).await;
+            let _ = events.send(Event::Injected {generation,device_id,message_id,success:matches!(result,Ok(Ok(()))),token}).await;
         });
         Ok(())
     }
 }
 
 /// The only transport task. No reconnect or buffering of offline application messages here.
-async fn transport(url: String, token: String, generation: u64, mut outbound: mpsc::Receiver<Value>, events: mpsc::Sender<Event>) -> Result<(),String> {
+async fn transport(url: String, token: String, generation: u64, mut outbound: mpsc::Receiver<Value>, events: mpsc::Sender<Event>, safety:Arc<Safety>) -> Result<(),String> {
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME));
     let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10),
@@ -359,7 +423,10 @@ async fn transport(url: String, token: String, generation: u64, mut outbound: mp
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     if text.len() > MAX_FRAME { return Err("oversized_frame".into()); }
-                    let message = serde_json::from_str(&text).map_err(|_| "invalid_message")?;
+                    let message:Value = serde_json::from_str(&text).map_err(|_| "invalid_message")?;
+                    if message["type"]=="peer-revoked" || (message["type"]=="error" && matches!(message["code"].as_str(),Some("unauthorized"|"room_deleted"|"replaced"|"revoked"))) {
+                        safety.cancel_transport(generation);
+                    }
                     events.send(Event::Frame(generation,message)).await.map_err(|_| "controller_stopped")?;
                 }
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {},
@@ -430,7 +497,7 @@ mod tests {
         state["peers"][&device_id]=json!({"name":"Phone","publicKey":phone["publicKey"]});
         let (_,commands)=mpsc::channel(4); let (events,event_rx)=mpsc::channel(4); let (tx,rx)=mpsc::channel(16);
         let path=std::env::temp_dir().join(format!("teleport-controller-test-{}",Uuid::new_v4())).join("identity.dpapi");
-        let actor=Actor {path,emit:Arc::new(|_,_|{}),state:Some(state),http:reqwest::Client::new(),commands,events,event_rx,
+        let actor=Actor {safety:Arc::new(Safety::new()),path,emit:Arc::new(|_,_|{}),state:Some(state),http:reqwest::Client::new(),commands,events,event_rx,
             transport:None,outbound:Some(tx),generation:1,connected:true,stopped:false,paused:true,retry:None,attempts:0,
             session:Uuid::new_v4().to_string(),pending:HashMap::new(),online:HashSet::from([device_id.clone()]),gate:Gate::default(),injecting:false};
         (actor,rx,phone,device_id)
@@ -499,6 +566,45 @@ mod tests {
         actor.receive(json!({"type":"pair-request","deviceId":id,"publicKey":phone["publicKey"],"name":"Phone"})).await.unwrap();
         assert!(actor.command("approve",json!({"deviceId":id,"confirmed":true})).await.is_err());
         assert!(output.try_recv().is_err()); assert!(actor.state().unwrap()["peers"].get(&id).is_none());
+    }
+
+    #[tokio::test] async fn emergency_handle_cancels_native_before_a_full_command_queue_can_progress() {
+        let safety=Arc::new(Safety::new()); safety.resume(0).unwrap(); let token=safety.begin().unwrap();
+        let (tx,_rx)=mpsc::channel(1); let (reply,_)=oneshot::channel();
+        tx.try_send(Command{name:"status".into(),args:json!({}),epoch:0,reply}).unwrap();
+        let handle=Handle{commands:tx,safety:safety.clone()};
+        let mut request=std::pin::pin!(handle.call("pause",json!({"paused":true})));
+        // Poll once: cancellation must run synchronously before the blocked channel await.
+        assert!(matches!(futures_util::poll!(request.as_mut()),std::task::Poll::Pending));
+        assert!(token.load(Ordering::Acquire)); assert!(safety.emergency.load(Ordering::SeqCst));
+        assert!(safety.begin().is_err());
+    }
+    #[test] fn old_resume_cannot_override_newer_emergency_and_tokens_are_never_reused() {
+        let safety=Safety::new(); safety.resume(0).unwrap(); let old=safety.begin().unwrap();
+        safety.cancel(); let epoch=safety.epoch.load(Ordering::SeqCst);
+        assert!(old.load(Ordering::Acquire)); assert!(safety.resume(epoch).is_err());
+        safety.finish(&old);
+        assert_eq!(safety.resume(0),Err("newer_stop_requested".into()));
+        safety.resume(epoch).unwrap(); let fresh=safety.begin().unwrap();
+        assert!(!Arc::ptr_eq(&old,&fresh)); assert!(!fresh.load(Ordering::Acquire)); assert!(old.load(Ordering::Acquire));
+        safety.finish(&old); assert!(safety.resume(epoch).is_err()); // stale completion cannot clear fresh token
+        safety.cancel(); assert!(fresh.load(Ordering::Acquire));
+    }
+    #[tokio::test] async fn emergency_flag_refuses_new_text_before_queued_pause_is_processed() {
+        let (mut actor,mut output,phone,id)=actor_fixture(); actor.paused=false;
+        actor.safety.resume(actor.safety.epoch.load(Ordering::SeqCst)).unwrap();
+        let message=phone_message(&actor,&phone,&id);
+        actor.safety.cancel(); // Handle has acted, actor has not yet processed its command.
+        actor.receive_text(&message).await.unwrap();
+        let ack=decrypt_outbound(&actor,&phone,&id,&output.try_recv().unwrap());
+        assert_eq!(ack["code"],"paused"); assert!(!actor.injecting); assert_eq!(actor.status()["paused"],true);
+    }
+
+    #[test] fn stale_transport_cannot_cancel_current_session_but_live_disconnect_can() {
+        let safety=Safety::new(); safety.transport.store(2,Ordering::SeqCst); safety.resume(0).unwrap();
+        let token=safety.begin().unwrap(); safety.cancel_transport(1);
+        assert!(!token.load(Ordering::Acquire)); assert!(!safety.emergency.load(Ordering::SeqCst));
+        safety.cancel_transport(2); assert!(token.load(Ordering::Acquire)); assert!(safety.emergency.load(Ordering::SeqCst));
     }
 
 }
