@@ -47,3 +47,16 @@ test('native diagnostic codes all have safe explanations and never override unkn
  assert.match(ackMessage('unknown','input_focus_changed'),/焦点发生变化/);
  assert.match(ackMessage('rejected','input_unsupported_control'),/自定义输入框/);
 });
+
+test('Enter capability is opt-in and strictly true on a ready payload',async()=>{
+ const {supportsPressEnter} = await import('../src/security.mjs');
+ assert.equal(supportsPressEnter({kind:'ready',capabilities:{pressEnter:true}}),true);
+ for(const payload of [null,{}, {kind:'ready'}, {kind:'authenticated',capabilities:{pressEnter:true}}, ...[false,'true',1,null,undefined].map(pressEnter=>({kind:'ready',capabilities:{pressEnter}})), {kind:'ready',capabilities:[]}]) assert.equal(supportsPressEnter(payload),false);
+});
+test('frozen Enter diagnostics warn of possible action without asserting application delivery',()=>{
+ assert.match(ackMessage('unknown','input_focus_changed',true),/结果未知.*Enter.*勿重复/);
+ assert.match(unknownMessage('timeout',true),/超过 15 秒.*Enter/);
+ assert.match(ackMessage('injected',undefined,true),/Enter.*无法确认目标应用/);
+ assert.doesNotMatch(ackMessage('unknown',undefined,false),/Enter/);
+ assert.match(ackMessage('rejected','unsupported_action'),/不支持附带回车.*\[unsupported_action\]/);
+});

@@ -10,3 +10,27 @@ const msg=(now=Date.now())=>({kind:'text',id:crypto.randomUUID(),sessionId:'s',t
 test('gate rejects duplication before injection',()=>{let g=new ReceiverGate('s'),m=msg();assert.equal(g.accept(m).ok,true);assert.equal(g.accept(m).code,'duplicate');});
 test('gate guards stale, future, session, size and controls',()=>{let now=Date.now(), g=new ReceiverGate('s');for(let patch of [{expiresAt:now-1},{sentAt:now+9000},{sessionId:'other'},{text:'x'.repeat(8193)},{text:'\x1b[31m'},{text:''},{expiresAt:now+30000}])assert.equal(g.accept({...msg(now),...patch},{now}).ok,false);assert.equal(g.accept(msg(now),{paused:true}).code,'paused');assert.equal(g.accept(msg(now),{authorized:false}).code,'unauthorized');});
 test('reject low-order peer keys',()=>{assert.throws(()=>seal({kind:'text'},c,'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',a.secretKey),/invalid_peer_key/);});
+
+test('optional pressEnter is legacy-compatible but strictly boolean when present',()=>{
+ const gate = new ReceiverGate('s');
+ assert.equal(gate.accept(msg()).ok,true);
+ for(const pressEnter of [false,true]) assert.equal(gate.accept({...msg(),pressEnter}).ok,true);
+ for(const pressEnter of [null,undefined,0,1,'true','false',[],{}]) assert.equal(gate.accept({...msg(),pressEnter}).code,'invalid_press_enter');
+ const invalid={...msg(),pressEnter:'true'};
+ assert.equal(gate.accept(invalid).code,'invalid_press_enter');
+ assert.equal(gate.accept({...invalid,pressEnter:false}).ok,true,'invalid options must not consume message IDs');
+});
+test('pressEnter option is authenticated and frozen inside ciphertext with unchanged text',()=>{
+ const payload={...msg(),text:'line 1\nline 2',pressEnter:true};
+ const envelope=seal(payload,c,b.publicKey,a.secretKey);
+ payload.pressEnter=false;
+ const received=open(envelope,c,a.publicKey,b.secretKey);
+ assert.equal(received.pressEnter,true);assert.equal(received.text,'line 1\nline 2');
+ assert.equal(JSON.stringify(envelope).includes('pressEnter'),false);
+});
+test('text schema rejects unknown action fields without consuming the message ID',()=>{
+ const gate=new ReceiverGate('s');
+ for(const extra of [{execute:true},{action:'enter'},{press_enter:true},{mode:'unicode'},{capabilities:{pressEnter:true}}]) {
+  const message=msg();assert.equal(gate.accept({...message,...extra}).code,'invalid_message');assert.equal(gate.accept(message).ok,true);
+ }
+});

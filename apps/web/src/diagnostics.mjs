@@ -41,14 +41,17 @@ const inputReasons = Object.freeze({
   "input_runtime_id_unavailable": "无法验证目标输入框身份，安全检查已停止输入。",
   "input_focus_changed": "输入期间目标焦点发生变化，请检查原窗口和当前窗口。",
   "input_automation_unavailable": "Windows 辅助功能接口不可用，请检查桌面端状态。",
+  "invalid_press_enter": "回车选项格式无效，请刷新手机页面后重试。",
+  "unsupported_action": "当前电脑端不支持附带回车，请升级电脑端或关闭此选项。",
   "injection_unconfirmed": "电脑未能确认输入处理结果。"
 });
 export const INPUT_DIAGNOSTIC_CODES = Object.freeze(Object.keys(inputReasons));
-export function ackMessage(status, code) {
- if (status === 'injected') return '电脑已提交输入事件，但无法确认目标应用是否接收。若目标应用没有文字，请先点击目标输入框并检查应用权限；草稿已保留，不会自动重发。';
+export function ackMessage(status, code, pressEnter = false) {
+ const enterNote = pressEnter === true ? '本次请求包含 Enter；它可能触发发送消息或执行命令，请先检查目标应用，勿重复操作。' : '';
+ if (status === 'injected') return enterNote + '电脑已提交输入事件，但无法确认目标应用是否接收。若目标应用没有文字，请先点击目标输入框并检查应用权限；草稿已保留，不会自动重发。';
  const reason = typeof code === 'string' && Object.hasOwn(inputReasons, code) ? `${inputReasons[code]}[${code}] ` : '';
  if (status === 'rejected') return `电脑拒绝了这次发送。${reason || '请检查电脑端接收状态和目标输入框。'}草稿已保留，不会自动重发。`;
- return `结果未知：可能已输入全部或部分文字。${reason}请先检查电脑，再决定是否手动发送；草稿已保留，不会自动重发。`;
+ return `结果未知：可能已输入全部或部分文字。${enterNote}${reason}请先检查电脑，再决定是否手动发送；草稿已保留，不会自动重发。`;
 }
 export function sendBlockReason({hasDevice, enabled, online, connected, approved, ready, paused, pending, bytes}) {
  if (pending) return '等待电脑确认中（最多 15 秒），请勿重复发送。';
@@ -63,7 +66,7 @@ export function sendBlockReason({hasDevice, enabled, online, connected, approved
  if (bytes === 0) return '还没有文字：先输入或粘贴内容，再点击发送。';
  return '';
 }
-export function unknownMessage(reason) {
+export function unknownMessage(reason, pressEnter = false) {
  const detail = reason === 'timeout' ? '等待电脑确认已超过 15 秒。' : reason === 'disconnected' ? '等待确认时连接或电脑会话中断。' : '';
- return `${detail}${ackMessage('unknown')}`;
+ return `${detail}${ackMessage('unknown', undefined, pressEnter)}`;
 }

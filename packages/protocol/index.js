@@ -81,6 +81,8 @@ export class ReceiverGate {
     if (!authorized) return { ok: false, code: 'unauthorized' };
     if (paused) return { ok: false, code: 'paused' };
     if (!message || message.kind !== 'text' || typeof message.id !== 'string' || !/^[a-zA-Z0-9-]{16,64}$/.test(message.id)) return { ok: false, code:'invalid_message' };
+    if (Object.keys(message).some(key => !['kind','id','sessionId','text','sentAt','expiresAt','pressEnter'].includes(key))) return { ok:false, code:'invalid_message' };
+    if (Object.hasOwn(message, 'pressEnter') && typeof message.pressEnter !== 'boolean') return { ok:false, code:'invalid_press_enter' };
     if (message.sessionId !== this.sessionId) return { ok:false, code:'session_mismatch' };
     if (!Number.isSafeInteger(message.sentAt) || !Number.isSafeInteger(message.expiresAt) || message.sentAt > now + 5000 || message.expiresAt <= now || message.expiresAt - message.sentAt > TTL_MS || message.expiresAt <= message.sentAt) return {ok:false,code:'expired'};
     if (typeof message.text !== 'string' || message.text.length === 0 || utf8Length(message.text) > MAX_TEXT_BYTES || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(message.text)) return {ok:false,code:'invalid_text'};

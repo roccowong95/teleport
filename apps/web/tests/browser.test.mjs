@@ -15,16 +15,16 @@ before(async()=>{
  browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH || undefined,chromiumSandbox:true});
 });
 after(async()=>{await browser?.close();server?.kill();});
-async function setup({ready=true}={}){
+async function setup({ready=true,capabilities,savedDevices=[saved]}={}){
  const context=await browser.newContext({viewport:{width:390,height:844}});
- await context.addInitScript(d=>localStorage.setItem('teleport.devices.v1',JSON.stringify([d])), saved);
+ await context.addInitScript(d=>localStorage.setItem('teleport.devices.v1',JSON.stringify(d)), savedDevices);
  const relays=[];let wire;
- await context.routeWebSocket('**/ws',ws=>{wire=ws;ws.onMessage(raw=>{const msg=JSON.parse(raw);if(msg.type==='auth'){ws.send(JSON.stringify({type:'authenticated',status:'approved',role:'sender'}));if(ready)sendReady(ws);}else if(msg.type==='relay')relays.push(msg);});});
+ await context.routeWebSocket('**/ws',ws=>{wire=ws;ws.onMessage(raw=>{const msg=JSON.parse(raw);if(msg.type==='auth'){ws.send(JSON.stringify({type:'authenticated',status:'approved',role:'sender'}));if(ready)sendReady(ws,capabilities ? {capabilities} : {});}else if(msg.type==='relay')relays.push(msg);});});
  const page=await context.newPage();await page.goto(origin);await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('已'));
  return {context,page,relays,get wire(){return wire;}};
 }
 function encrypted(payload){return {type:'data',from:'owner',envelope:seal(payload,{roomId,sender:'owner',recipient:deviceId},phone.publicKey,owner.secretKey)};}
-function sendReady(ws){ws.send(JSON.stringify(encrypted({kind:'ready',sessionId:'session-test',targetLabel:'当前焦点窗口',paused:false})));}
+function sendReady(ws,extra={}){ws.send(JSON.stringify(encrypted({kind:'ready',sessionId:'session-test',targetLabel:'当前焦点窗口',paused:false,...extra})));}
 test('mobile layout and encrypted send preserve draft; Enter never sends; disconnect disables reconnect',async()=>{
  const t=await setup();try{
  await t.page.locator('#draft').fill('你好，Teleport');await t.page.locator('#draft').press('Enter');assert.equal(t.relays.length,0);
@@ -119,5 +119,62 @@ test('ACK timeout shows elapsed limit and unknown result without replay or draft
   assert.match(await t.page.locator('#result').textContent(),/超过 15 秒.*结果未知/);
   assert.equal(await t.page.locator('#draft').inputValue(),'超时仍保留');
   await t.page.clock.fastForward(60000);await expect.poll(()=>t.relays.length).toBe(1);
+ }finally{await t.context.close();}
+});
+
+test('legacy receiver cannot silently enable Enter; only encrypted strict capability unlocks the option',async()=>{
+ const t=await setup();try{
+  const option=t.page.locator('#press-enter');
+  assert.equal(await option.isChecked(),false);assert.equal(await option.isDisabled(),true);
+  assert.match(await t.page.locator('#enter-availability').textContent(),/升级电脑端/);
+  t.wire.send(JSON.stringify({type:'ready',capabilities:{pressEnter:true}}));
+  t.wire.send(JSON.stringify({type:'authenticated',status:'approved',role:'sender',capabilities:{pressEnter:true}}));
+  await t.page.waitForTimeout(80);assert.equal(await option.isDisabled(),true);
+  sendReady(t.wire,{capabilities:{pressEnter:'true'}});await t.page.waitForTimeout(80);assert.equal(await option.isDisabled(),true);
+  await t.page.locator('#draft').fill('旧电脑仅文字');await t.page.locator('#send').click();await expect.poll(()=>t.relays.length).toBe(1);
+  const legacy=open(t.relays[0].envelope,{roomId,sender:deviceId,recipient:'owner'},phone.publicKey,owner.secretKey);
+  assert.equal(legacy.pressEnter,false);
+  t.wire.send(JSON.stringify(encrypted({kind:'ack',id:legacy.id,status:'injected'})));
+  sendReady(t.wire,{capabilities:{pressEnter:true}});await expect(option).toBeEnabled();assert.equal(await option.isChecked(),false);
+ }finally{await t.context.close();}
+});
+
+test('explicit Enter choice is encrypted and frozen per send; typing Enter remains a newline; no replay',async()=>{
+ const t=await setup({capabilities:{pressEnter:true}});try{
+  const option=t.page.locator('#press-enter');await expect(option).toBeEnabled();assert.equal(await option.isChecked(),false);
+  assert.match(await t.page.locator('#enter-warning').textContent(),/微信.*发送消息.*终端.*执行命令/);
+  await option.check();await t.page.locator('#draft').fill('仅测试文本');await t.page.locator('#draft').press('Enter');assert.equal(t.relays.length,0);
+  await t.page.locator('#send').click();await expect.poll(()=>t.relays.length).toBe(1);assert.equal(await option.isDisabled(),true);
+  const sent=open(t.relays[0].envelope,{roomId,sender:deviceId,recipient:'owner'},phone.publicKey,owner.secretKey);
+  assert.equal(sent.pressEnter,true);assert.equal(sent.text,'仅测试文本\n');assert.equal(JSON.stringify(t.relays[0]).includes('pressEnter'),false);
+  // Even a changed UI value cannot change the in-flight choice or ACK warning.
+  await t.page.evaluate(()=>{document.querySelector('#press-enter').checked=false;});
+  t.wire.send(JSON.stringify(encrypted({kind:'ack',id:sent.id,status:'unknown',code:'input_posting_unconfirmed'})));
+  await t.page.waitForFunction(()=>document.querySelector('#result').textContent.includes('结果未知'));
+  assert.match(await t.page.locator('#result').textContent(),/Enter.*勿重复/);
+  assert.equal(await t.page.locator('#draft').inputValue(),'仅测试文本\n');await t.page.waitForTimeout(100);assert.equal(t.relays.length,1);
+ }finally{await t.context.close();}
+});
+
+test('Enter option resets on lost capability, changed session, pause, disconnect and refresh',async()=>{
+ const t=await setup({capabilities:{pressEnter:true}});try{
+  const option=t.page.locator('#press-enter');await expect(option).toBeEnabled();await option.check();
+  sendReady(t.wire);await expect(option).toBeDisabled();assert.equal(await option.isChecked(),false);
+  sendReady(t.wire,{capabilities:{pressEnter:true}});await expect(option).toBeEnabled();await option.check();
+  sendReady(t.wire,{sessionId:'new-session',capabilities:{pressEnter:true}});await expect(option).not.toBeChecked();
+  await option.check();sendReady(t.wire,{sessionId:'new-session',paused:true,capabilities:{pressEnter:true}});await expect(option).toBeDisabled();assert.equal(await option.isChecked(),false);
+  sendReady(t.wire,{capabilities:{pressEnter:true}});await expect(option).toBeEnabled();await option.check();
+  await t.page.locator('#connect').click();assert.equal(await option.isChecked(),false);assert.equal(await option.isDisabled(),true);
+  await t.page.locator('#connect').click();await expect(option).toBeEnabled();assert.equal(await option.isChecked(),false);
+  await option.check();await t.page.reload();await expect(option).toBeEnabled();assert.equal(await option.isChecked(),false);assert.equal(t.relays.length,0);
+ }finally{await t.context.close();}
+});
+
+test('switching devices discards the Enter choice without sending an action',async()=>{
+ const second={...saved,deviceId:'4a34185a-4570-4ab9-9bdb-14653f6cac76',name:'另一台电脑',enabled:false};
+ const t=await setup({capabilities:{pressEnter:true},savedDevices:[saved,second]});try{
+  const option=t.page.locator('#press-enter');await expect(option).toBeEnabled();await option.check();
+  await t.page.locator('#devices').selectOption(second.deviceId);assert.equal(await option.isChecked(),false);assert.equal(await option.isDisabled(),true);
+  await t.page.locator('#devices').selectOption(saved.deviceId);await expect(option).toBeEnabled();assert.equal(await option.isChecked(),false);assert.equal(t.relays.length,0);
  }finally{await t.context.close();}
 });

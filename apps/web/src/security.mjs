@@ -11,3 +11,7 @@ export function canSend({ connected, ready, approved, paused, pending, bytes }) 
   return connected && ready && approved && !paused && !pending && bytes > 0 && bytes <= 8192;
 }
 export function retryDelay(attempt, random = Math.random()) { return Math.min(30000, 1000 * 2 ** Math.min(attempt, 5)) + Math.floor(random * 500); }
+/** Accept action support only from an already authenticated/decrypted ready payload. */
+export function supportsPressEnter(payload) {
+ return payload?.kind === 'ready' && payload.capabilities !== null && typeof payload.capabilities === 'object' && !Array.isArray(payload.capabilities) && Object.hasOwn(payload.capabilities, 'pressEnter') && payload.capabilities.pressEnter === true;
+}

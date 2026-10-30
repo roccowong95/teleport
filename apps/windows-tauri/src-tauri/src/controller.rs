@@ -112,7 +112,7 @@ struct Command { name: String, args: Value, epoch: u64, reply: oneshot::Sender<R
 
 impl Handle {
     pub async fn call(&self, cmd: &str, args: Value) -> Result<Value, String> {
-        if matches!(cmd,"disconnect"|"stop"|"revoke"|"reset") || (cmd=="pause" && args["paused"]==true) { self.safety.cancel(); }
+        if matches!(cmd,"disconnect"|"stop"|"revoke"|"reset"|"set_input_mode") || (cmd=="pause" && args["paused"]==true) { self.safety.cancel(); }
         let epoch=self.safety.epoch.load(Ordering::SeqCst);
         let (reply, answer) = oneshot::channel();
         self.commands.send(Command {name: cmd.into(), args, epoch, reply}).await.map_err(|_| "controller_stopped")?;
@@ -132,7 +132,7 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
     let actor = Actor {safety:safety.clone(),path, emit, state, http, commands: rx, events, event_rx,
         transport: None, outbound: None, generation: 0, connected: false, stopped: false,
         paused: true, retry: None, attempts: 0, session: Uuid::new_v4().to_string(),
-        pending: HashMap::new(), online: HashSet::new(), gate: Gate::default(), injecting: false};
+        pending: HashMap::new(), online: HashSet::new(), gate: Gate::default(), injecting: false, input_mode:input::InputMode::Strict};
     tokio::spawn(actor.run());
     Ok(Handle {commands,safety})
 }
@@ -145,7 +145,7 @@ struct Actor {
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>, event_rx: mpsc::Receiver<Event>,
     transport: Option<JoinHandle<()>>, outbound: Option<mpsc::Sender<Value>>, generation: u64,
     connected: bool, stopped: bool, paused: bool, retry: Option<Instant>, attempts: u32,
-    session: String, pending: HashMap<String, Pending>, online: HashSet<String>, gate: Gate, injecting: bool,
+    session: String, pending: HashMap<String, Pending>, online: HashSet<String>, gate: Gate, injecting: bool, input_mode:input::InputMode,
 }
 impl Actor {
     async fn run(mut self) {
@@ -202,10 +202,12 @@ impl Actor {
         let devices = self.state.as_ref().and_then(|s| s["peers"].as_object()).map(|peers| peers.iter().map(|(id,p)| json!({"deviceId":id,"name":p["name"],"online":self.online.contains(id)})).collect::<Vec<_>>()).unwrap_or_default();
         json!({"configured":self.state.is_some(),"disconnected":self.stopped,"connected":self.connected,
             "paused":self.paused || self.safety.emergency.load(Ordering::SeqCst),"name":self.state.as_ref().map(|s| &s["name"]),
-            "endpoint":self.state.as_ref().map(|s| &s["endpoint"]),"targetLabel":TARGET,"devices":devices})
+            "endpoint":self.state.as_ref().map(|s| &s["endpoint"]),"targetLabel":TARGET,"devices":devices,
+            "inputMode":match self.input_mode {input::InputMode::Strict=>"strict",input::InputMode::Compatibility=>"compatibility"}})
     }
     fn changed(&self) { (self.emit)("status", self.status()); }
     fn stop(&mut self) {
+        self.input_mode=input::InputMode::Strict;
         self.generation = self.generation.wrapping_add(1);
         self.safety.transport.store(self.generation,Ordering::SeqCst);
         self.safety.cancel();
@@ -233,6 +235,7 @@ impl Actor {
         self.changed();
     }
     fn disconnected(&mut self) {
+        self.input_mode=input::InputMode::Strict;
         self.safety.cancel();
         self.connected = false; self.paused = true; self.online.clear(); self.pending.clear(); self.outbound = None;
         if let Some(task) = self.transport.take() { task.abort(); }
@@ -254,7 +257,7 @@ impl Actor {
         self.send(json!({"type":"relay","to":id,"envelope":envelope}))
     }
     fn ready(&self, id: &str) -> Result<(), String> {
-        self.encrypted(id,json!({"kind":"ready","sessionId":self.session,"targetLabel":TARGET,"paused":self.paused || self.safety.emergency.load(Ordering::SeqCst)}))
+        self.encrypted(id,json!({"kind":"ready","sessionId":self.session,"targetLabel":TARGET,"paused":self.paused || self.safety.emergency.load(Ordering::SeqCst),"capabilities":{"pressEnter":true}}))
     }
     async fn request_for(&self, state: &Value, suffix: &str, method: reqwest::Method, body: Option<Value>) -> Result<Value,String> {
         let url = format!("{}/api/rooms{}",string(state,"endpoint")?,suffix);
@@ -302,6 +305,25 @@ impl Actor {
                 else { if self.injecting { return Err("input_busy".into()); } self.safety.resume(epoch)?; }
                 self.paused = paused;
                 for id in &self.online { let _ = self.ready(id); }
+            }
+            "set_input_mode" => {
+                // Cancellation happens in Handle before queueing, and again here for direct
+                // actor callers. Mode changes never resume input or un-cancel an old token.
+                let newer_stop=self.safety.epoch.load(Ordering::SeqCst)!=epoch;
+                self.safety.cancel(); self.paused=true;
+                for id in &self.online { let _=self.ready(id); }
+                self.changed(); // Even invalid/unconfirmed requests leave input safely paused.
+                let mode=match args["mode"].as_str() {
+                    Some("strict")=>input::InputMode::Strict,
+                    Some("compatibility")=>input::InputMode::Compatibility,
+                    _=>return Err("invalid_input_mode".into()),
+                };
+                if mode==input::InputMode::Compatibility {
+                    if args["confirmed"]!=true { return Err("compatibility_confirmation_required".into()); }
+                    if newer_stop { return Err("newer_stop_requested".into()); }
+                    if !self.connected || self.stopped { return Err("relay_offline".into()); }
+                }
+                self.input_mode=mode; // Session-only; deliberately never written to identity state.
             }
             "pairing" => {
                 if !self.connected { return Err("relay_offline".into()); }
@@ -441,13 +463,15 @@ impl Actor {
         let text = string(&payload,"text")?.to_owned();
         let device_id = id.to_owned(); let message_id = string(&payload,"id")?.to_owned();
         let events = self.events.clone(); let generation = self.generation;
+        let mode=self.input_mode; // Immutable snapshot: UI changes cancel, never mutate a running injection.
+        let press_enter=payload.get("pressEnter").and_then(Value::as_bool).unwrap_or(false);
         self.injecting = true;
         // Exactly one attempt; do not block actor pause/revoke/disconnect handling.
         // Already-posted OS events cannot be undone. Never run a second injection until
         // the native call really returns: dropping a timed-out blocking task cannot stop it.
         tokio::spawn(async move {
             let native_token=token.clone();
-            let result = tokio::task::spawn_blocking(move || input::inject_cancellable(&text,native_token)).await
+            let result = tokio::task::spawn_blocking(move || input::inject_cancellable_with_mode(&text,native_token,mode,press_enter)).await
                 .unwrap_or_else(|_|Err(input::InputFailure {code:"input_worker_failed",may_have_posted:true}));
             let _ = events.send(Event::Injected {generation,device_id,message_id,result,token}).await;
         });
@@ -521,13 +545,14 @@ impl Gate {
     fn accept(&mut self, message: &Value, session: &str, time: u64, paused: bool, authorized: bool) -> Result<(), &'static str> {
         if !authorized { return Err("unauthorized"); }
         if paused { return Err("paused"); }
-        if message["kind"] != "text" { return Err("invalid_message"); }
+        if message["kind"] != "text" || !message.as_object().is_some_and(|fields|fields.keys().all(|key|matches!(key.as_str(),"kind"|"id"|"sessionId"|"text"|"sentAt"|"expiresAt"|"pressEnter"))) { return Err("invalid_message"); }
         let id = message["id"].as_str().ok_or("invalid_message")?;
         if Uuid::parse_str(id).is_err() { return Err("invalid_message"); }
         if message["sessionId"] != session { return Err("session_mismatch"); }
         let sent = message["sentAt"].as_u64().ok_or("expired")?;
         let expires = message["expiresAt"].as_u64().ok_or("expired")?;
         if sent > time.saturating_add(5000) || expires <= time || expires <= sent || expires.saturating_sub(sent) > 15000 { return Err("expired"); }
+        if message.get("pressEnter").is_some_and(|flag|!flag.is_boolean()) { return Err("invalid_press_enter"); }
         let text = message["text"].as_str().ok_or("invalid_text")?;
         if text.is_empty() || text.len() > 8192 || text.chars().any(|c| matches!(c,'\u{0000}'..='\u{0008}' | '\u{000b}' | '\u{000c}' | '\u{000e}'..='\u{001f}' | '\u{007f}')) { return Err("invalid_text"); }
         self.seen.retain(|_,expiry| *expiry > time);
@@ -573,7 +598,7 @@ mod tests {
         let path=std::env::temp_dir().join(format!("teleport-controller-test-{}",Uuid::new_v4())).join("identity.dpapi");
         let actor=Actor {safety:Arc::new(Safety::new()),path,emit:Arc::new(|_,_|{}),state:Some(state),http:reqwest::Client::new(),commands,events,event_rx,
             transport:None,outbound:Some(tx),generation:1,connected:true,stopped:false,paused:true,retry:None,attempts:0,
-            session:Uuid::new_v4().to_string(),pending:HashMap::new(),online:HashSet::from([device_id.clone()]),gate:Gate::default(),injecting:false};
+            session:Uuid::new_v4().to_string(),pending:HashMap::new(),online:HashSet::from([device_id.clone()]),gate:Gate::default(),injecting:false,input_mode:input::InputMode::Strict};
         (actor,rx,phone,device_id)
     }
     fn phone_message(actor:&Actor,phone:&Value,id:&str) -> Value {
@@ -822,6 +847,72 @@ mod tests {
             let ack=decrypt_outbound(&actor,&phone,&id,&output.try_recv().unwrap());
             assert_eq!(ack["id"],payload["id"]); assert_eq!(ack["status"],"unknown");
             assert_eq!(ack["code"],if paused {"paused"} else {"expired"}); assert!(!actor.injecting);
+        }
+    }
+
+    #[tokio::test] async fn compatibility_requires_explicit_confirmation_and_is_session_only() {
+        let (mut actor,_,_,_)=actor_fixture(); assert_eq!(actor.status()["inputMode"],"strict");
+        assert_eq!(actor.command("set_input_mode",json!({"mode":"compatibility","confirmed":false})).await.unwrap_err(),"compatibility_confirmation_required");
+        assert_eq!(actor.status()["inputMode"],"strict"); assert!(actor.paused);
+        assert_eq!(actor.command("set_input_mode",json!({"mode":"automatic","confirmed":true})).await.unwrap_err(),"invalid_input_mode");
+        actor.command("set_input_mode",json!({"mode":"compatibility","confirmed":true})).await.unwrap();
+        assert_eq!(actor.status()["inputMode"],"compatibility"); assert!(actor.paused); assert!(actor.safety.emergency.load(Ordering::SeqCst));
+        assert!(actor.state().unwrap().get("inputMode").is_none());
+        actor.command("pause",json!({"paused":false})).await.unwrap(); assert_eq!(actor.input_mode,input::InputMode::Compatibility);
+        actor.disconnected(); assert_eq!(actor.status()["inputMode"],"strict"); assert!(actor.paused);
+        assert_eq!(actor.command("set_input_mode",json!({"mode":"compatibility","confirmed":true})).await.unwrap_err(),"relay_offline");
+        actor.input_mode=input::InputMode::Compatibility; actor.connect(); assert_eq!(actor.input_mode,input::InputMode::Strict); actor.stop();
+        assert_eq!(actor.status()["inputMode"],"strict");
+    }
+    #[tokio::test] async fn stale_compatibility_enable_cannot_override_newer_disconnect() {
+        let (mut actor,_,_,_)=actor_fixture(); let old_epoch=actor.safety.epoch.load(Ordering::SeqCst);
+        actor.safety.cancel();
+        assert_eq!(actor.command_at("set_input_mode",json!({"mode":"compatibility","confirmed":true}),old_epoch).await.unwrap_err(),"newer_stop_requested");
+        assert_eq!(actor.status()["inputMode"],"strict"); assert!(actor.paused);
+    }
+    #[tokio::test] async fn mode_change_cancels_inflight_without_mutating_snapshot_or_resuming() {
+        let (mut actor,_,_,_)=actor_fixture();
+        actor.command("set_input_mode",json!({"mode":"compatibility","confirmed":true})).await.unwrap();
+        actor.command("pause",json!({"paused":false})).await.unwrap();
+        let snapshot=actor.input_mode; let token=actor.safety.begin().unwrap(); actor.injecting=true;
+        actor.command("set_input_mode",json!({"mode":"strict","confirmed":false})).await.unwrap();
+        assert!(token.load(Ordering::Acquire)); assert!(actor.injecting); assert!(actor.paused);
+        assert_eq!(snapshot,input::InputMode::Compatibility); assert_eq!(actor.input_mode,input::InputMode::Strict);
+        assert_eq!(actor.command("pause",json!({"paused":false})).await.unwrap_err(),"input_busy");
+        assert_eq!(native_outcome(Err(input::InputFailure{code:"input_cancelled",may_have_posted:true}),true).0,"unknown");
+    }
+    #[tokio::test] async fn mode_command_cancels_before_full_queue_await() {
+        let safety=Arc::new(Safety::new()); safety.resume(0).unwrap(); let token=safety.begin().unwrap();
+        let (tx,_rx)=mpsc::channel(1); let (reply,_)=oneshot::channel();
+        tx.try_send(Command{name:"status".into(),args:json!({}),epoch:0,reply}).unwrap();
+        let handle=Handle{commands:tx,safety:safety.clone()};
+        let mut request=std::pin::pin!(handle.call("set_input_mode",json!({"mode":"compatibility","confirmed":true})));
+        assert!(matches!(futures_util::poll!(request.as_mut()),std::task::Poll::Pending));
+        assert!(token.load(Ordering::Acquire)); assert!(safety.emergency.load(Ordering::SeqCst));
+    }
+    #[test] fn enter_flag_is_optional_false_by_default_and_strictly_boolean() {
+        for flag in [None,Some(json!(false)),Some(json!(true))] {
+            let mut payload=text(); if let Some(flag)=flag {payload["pressEnter"]=flag;}
+            assert!(Gate::default().accept(&payload,"session",1000,false,true).is_ok());
+            assert_eq!(payload.get("pressEnter").and_then(Value::as_bool).unwrap_or(false),payload["pressEnter"]==true);
+        }
+        for flag in [json!(1),json!("true"),Value::Null,json!([]),json!({})] {
+            let mut payload=text(); payload["pressEnter"]=flag;
+            assert_eq!(Gate::default().accept(&payload,"session",1000,false,true),Err("invalid_press_enter"));
+        }
+    }
+    #[tokio::test] async fn enter_capability_is_only_in_authenticated_encrypted_ready() {
+        let (actor,mut output,phone,id)=actor_fixture(); actor.ready(&id).unwrap();
+        let frame=output.try_recv().unwrap(); assert!(frame.get("capabilities").is_none());
+        let ready=decrypt_outbound(&actor,&phone,&id,&frame);
+        assert_eq!(ready["kind"],"ready"); assert_eq!(ready["capabilities"],json!({"pressEnter":true}));
+        assert_eq!(ready["sessionId"],actor.session);
+    }
+
+    #[test] fn text_payload_cannot_smuggle_mode_or_other_control_fields() {
+        for field in ["mode","inputMode","compatibility","command","target","capabilities","unexpected"] {
+            let mut payload=text(); payload[field]=json!("compatibility");
+            assert_eq!(Gate::default().accept(&payload,"session",1000,false,true),Err("invalid_message"));
         }
     }
 

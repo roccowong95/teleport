@@ -10,6 +10,7 @@ fn local(window:&WebviewWindow)->Result<(),String>{if window.label()!="main" {re
 #[tauri::command] async fn approve(window:WebviewWindow,state:State<'_,Backend>,device_id:String,confirmed:bool)->Result<Value,String>{local(&window)?;state.handle.call("approve",json!({"deviceId":device_id,"confirmed":confirmed})).await}
 #[tauri::command] async fn connection(window:WebviewWindow,state:State<'_,Backend>,connected:bool)->Result<Value,String>{local(&window)?;state.handle.call(if connected{"connect"}else{"disconnect"},json!({})).await}
 #[tauri::command] async fn pause(window:WebviewWindow,state:State<'_,Backend>,paused:bool)->Result<Value,String>{local(&window)?;state.handle.call("pause",json!({"paused":paused})).await}
+#[tauri::command] async fn set_input_mode(window:WebviewWindow,state:State<'_,Backend>,mode:String,confirmed:bool)->Result<Value,String>{local(&window)?;state.handle.call("set_input_mode",json!({"mode":mode,"confirmed":confirmed})).await}
 #[tauri::command] async fn revoke(window:WebviewWindow,state:State<'_,Backend>,device_id:String)->Result<Value,String>{local(&window)?;state.handle.call("revoke",json!({"deviceId":device_id})).await}
 #[tauri::command] async fn reset(window:WebviewWindow,state:State<'_,Backend>,confirmed:bool)->Result<Value,String>{local(&window)?;state.handle.call("reset",json!({"confirmed":confirmed})).await}
 #[tauri::command] async fn smoke_ready(window:WebviewWindow,app:tauri::AppHandle,state:State<'_,Backend>)->Result<bool,String>{local(&window)?;if let Some(path)=&state.smoke { let status=state.handle.call("status",json!({})).await?;if status["configured"]!=false||status["paused"]!=true{return Err("smoke_state_invalid".into())}std::fs::write(path.join("smoke-result.json"),b"{\"ready\":true,\"renderer\":true}").map_err(|_|"smoke_write_failed")?;app.exit(0);return Ok(true)}Ok(false)}
@@ -35,7 +36,7 @@ pub fn run(){
   Ok(())
  })
  .on_window_event(|window,event|{if let tauri::WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide();}})
- .invoke_handler(tauri::generate_handler![status,setup,pairing,approve,connection,pause,revoke,reset,smoke_ready])
+ .invoke_handler(tauri::generate_handler![status,setup,pairing,approve,connection,pause,set_input_mode,revoke,reset,smoke_ready])
  .build(tauri::generate_context!()).expect("Teleport could not initialize secure local state");
  app.run(|_,_|{});
 }

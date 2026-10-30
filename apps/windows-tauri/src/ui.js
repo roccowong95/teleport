@@ -50,6 +50,8 @@ const ERROR_DETAILS = new Map([
   ['invalid_pair_expiry','The relay returned an invalid pairing expiry.'],
   ['changed_peer_key','The phone key changed. Reject the request and verify the device.'],
   ['confirmation_required','Confirm this action explicitly before retrying.'],
+  ['invalid_input_mode','The requested input mode was not recognized.'],
+  ['compatibility_confirmation_required','Compatibility input requires explicit acceptance of its risks.'],
   ['input_busy','An input operation is still finishing.'],
   ['newer_stop_requested','A newer pause or disconnect took priority. Input remains paused.'],
 ]);
@@ -102,10 +104,10 @@ function inputDiagnostic(result){
   if(status==='submitted')return 'Input diagnostic — submitted. Windows accepted the input events; this does not verify that the target app accepted or saved the text. Inspect the target field.';
   const code=typeof result?.code==='string'&&INPUT_DETAILS.has(result.code)?result.code:'unknown_input_result';
   const detail=INPUT_DETAILS.get(code)||'Unrecognized technical details were withheld to protect private data.';
-  const outcome=status==='rejected'?'This attempt was rejected. Inspect the target and resolve the issue before sending again.':'Some or all text may already have been entered. Inspect the target field before any manual retry; Teleport does not automatically resend.';
+  const outcome=status==='rejected'?'This attempt was rejected. Inspect the target and resolve the issue before sending again.':'Some or all text may already have been entered. If this request included Enter, it may also have been posted. Inspect the target field and app before any manual retry; Teleport does not automatically resend.';
   return `Input diagnostic — ${status} [${code}]. ${detail} ${outcome}`;
 }
-const STAGES={setup:'Setup command',setup_status:'Status refresh after successful setup',status:'Status refresh',pause:'Change input state',connection:'Change relay connection',pairing:'Create pairing code',approve:'Pairing approval',revoke:'Revoke phone',reset:'Reset room'};
+const STAGES={setup:'Setup command',setup_status:'Status refresh after successful setup',status:'Status refresh',pause:'Change input state',connection:'Change relay connection',pairing:'Create pairing code',approve:'Pairing approval',revoke:'Revoke phone',reset:'Reset room',set_input_mode:'Change input mode',input_mode_status:'Status refresh after input mode change'};
 class UiFailure extends Error{constructor(stage,code){super('Safe UI diagnostic');this.stage=stage;this.code=code;}}
 function safeCode(error){const value=typeof error==='string'?error:error instanceof Error?error.message:typeof error?.code==='string'?error.code:'';return ERROR_DETAILS.has(value)?value:'unknown_error';}
 function diagnostic(error){
@@ -118,7 +120,7 @@ function diagnostic(error){
 
 export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,setTimer=setTimeout,clearTimer=clearTimeout}) {
   const $=id=>document.getElementById(id);
-  let state={configured:false,connected:false,paused:true,devices:[]}, pending=null, qrTimer, pendingTimer, qrVersion=0, statusVersion=0, resetBusy=false;
+  let state={configured:false,connected:false,paused:true,devices:[]}, pending=null, qrTimer, pendingTimer, qrVersion=0, statusVersion=0, resetBusy=false, modeBusy=false;
   const busy=new Set(), unlisten=[];
   const notice=text=>{$('notice').textContent=text;};
   async function call(command,args,stage=command){try{return await invoke(command,args);}catch(error){throw new UiFailure(stage,safeCode(error));}}
@@ -127,7 +129,10 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
   async function action(key,fn){if(busy.has(key))return;busy.add(key);const button=$(key);if(button)button.disabled=true;notice('');try{await fn();}catch(error){notice(diagnostic(error));}finally{busy.delete(key);if(button)button.disabled=false;renderControls();}}
   function renderControls(){
     $('newPair').disabled=!state.connected||busy.has('newPair');
-    $('pause').disabled=!state.connected||busy.has('pause');
+    $('pause').disabled=!state.connected||busy.has('pause')||modeBusy;
+    $('inputModeToggle').disabled=!state.connected||modeBusy;
+    $('confirmInputMode').disabled=!state.connected||modeBusy;
+    $('cancelInputMode').disabled=modeBusy;
     $('connectionToggle').textContent=state.disconnected?'Connect to relay':'Disconnect';
     $('approve').disabled=!pending||busy.has('approvalAction');$('reject').disabled=!pending||busy.has('approvalAction');
   }
@@ -138,6 +143,12 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
     $('connection').textContent=`${state.connected?'Relay connected':'Relay offline'} · ${state.paused?'Input paused':'Input enabled'}`;
     $('target').textContent=state.targetLabel||'Focused editable field (Windows)';
     $('pause').textContent=state.paused?'Resume input':'Pause input';
+    const compatibility=state.inputMode==='compatibility';
+    $('inputModeStatus').textContent=compatibility?'Compatibility input mode — reduced target checks':'Strict input mode';
+    $('inputModeStatus').className=compatibility?'compatibility-active':'';
+    $('inputModeHint').textContent=compatibility?'Risk: text may go to the wrong place. App receipt is not verified. Focus and password/security guards still apply.':'Strict mode verifies the control type and writable-field metadata.';
+    $('inputModeToggle').textContent=compatibility?'Return to strict input':'Enable compatibility input…';
+    if((!state.connected||!state.configured||compatibility)&&$('inputModeDialog').open)$('inputModeDialog').close();
     const devices=Array.isArray(state.devices)?state.devices:[];$('devices').replaceChildren();$('noDevices').hidden=devices.length>0;
     for(const peer of devices){const li=document.createElement('li'),label=document.createElement('span'),button=document.createElement('button');label.textContent=`${peer.name} · ${peer.online?'online':'offline'}`;button.textContent='Revoke';button.type='button';button.className='secondary';button.onclick=()=>action(`revoke-${peer.deviceId}`,async()=>{button.disabled=true;try{await call('revoke',{deviceId:peer.deviceId});await refresh();}finally{button.disabled=false;}});li.append(label,button);$('devices').append(li);}
     if(!state.connected||!state.configured){clearQR();clearPending();}
@@ -160,6 +171,30 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
   for(const [id,confirmed] of [['approve',true],['reject',false]])$(id).onclick=()=>action('approvalAction',async()=>{
     if(!pending)return;const request=pending;renderControls();await call('approve',{deviceId:request.deviceId,confirmed});if(pending===request)clearPending();
   });
+  async function changeInputMode(mode,confirmed){
+    if(modeBusy)return;modeBusy=true;renderControls();notice('');$('inputModeError').textContent='';
+    try{
+      await call('set_input_mode',{mode,confirmed});
+      if($('inputModeDialog').open)$('inputModeDialog').close();
+      await refresh('input_mode_status');
+      notice('Input mode updated. Input is paused; resume separately when the intended target is focused.');
+    }catch(error){
+      const message=diagnostic(error)+' Input mode is not confirmed by this interface; check its displayed state before resuming.';
+      if($('inputModeDialog').open)$('inputModeError').textContent=message;else notice(message);
+    }finally{modeBusy=false;renderControls();}
+  }
+  $('inputModeToggle').onclick=()=>{
+    if(modeBusy||!state.connected)return;
+    if(state.inputMode==='compatibility')return changeInputMode('strict',false);
+    if($('inputModeDialog').open)return;
+    $('inputModeError').textContent='';$('inputModeDialog').showModal();$('cancelInputMode').focus();
+  };
+  $('cancelInputMode').onclick=()=>{if(!modeBusy)$('inputModeDialog').close();};
+  $('inputModeDialog').addEventListener('cancel',event=>{if(modeBusy)event.preventDefault();});
+  $('confirmInputMode').onclick=()=>{
+    if(modeBusy||!state.connected||!$('inputModeDialog').open||state.inputMode==='compatibility')return;
+    return changeInputMode('compatibility',true);
+  };
   $('reset').onclick=()=>{if(resetBusy||$('resetDialog').open)return;$('resetError').textContent='';$('resetDialog').showModal();$('cancelReset').focus();};
   $('cancelReset').onclick=()=>{if(!resetBusy)$('resetDialog').close();};
   $('resetDialog').addEventListener('cancel',event=>{if(resetBusy)event.preventDefault();});

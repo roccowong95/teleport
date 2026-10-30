@@ -114,6 +114,8 @@ export class Receiver extends EventEmitter {
     const payload = await open(message.envelope, {roomId:this.state.roomId,sender:id,recipient:'owner'}, peer.publicKey, this.state.secretKey);
     const result = this.gate.accept(payload, {paused:this.paused,authorized:true,now:this.now()});
     if (!result.ok) { if (typeof payload?.id === 'string') await this.encrypted(id,{kind:'ack',id:payload.id,status:'rejected',code:result.code}); return; }
+    // Legacy adapters do not implement a distinct Enter action. Never silently downgrade it.
+    if (payload.pressEnter === true) { await this.encrypted(id,{kind:'ack',id:payload.id,status:'rejected',code:'unsupported_action'}); return; }
     let status = 'injected', code;
     try { await this.adapter.inject(payload.text); } catch { status = 'unknown'; code = 'injection_unconfirmed'; }
     await this.encrypted(id,{kind:'ack',id:payload.id,status,...(code ? {code} : {})});

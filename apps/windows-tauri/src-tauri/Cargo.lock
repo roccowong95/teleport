@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "teleport-windows"
-version = "0.2.0-alpha.3"
+version = "0.2.0-alpha.4"
 dependencies = [
  "base64 0.22.1",
  "crypto_box",

@@ -1,5 +1,5 @@
 //! Narrow, fail-closed Windows text insertion. No clipboard, elevation, UIAccess,
-//! target-text reads, synthesized Return, or automatic retry. Success means events
+//! target-text reads, implicit Return, or automatic retry. Optional Enter is explicit. Success means events
 //! were posted, never that the target application saved/accepted them.
 
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -66,6 +66,33 @@ fn unicode_chunks(text: &str) -> Vec<Vec<u16>> {
     chunks
 }
 
+/// Explicit per-injection choice; callers must never automatically retry in compatibility mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    Strict,
+    Compatibility,
+}
+
+#[cfg(any(windows, test))]
+fn require_nonpassword_and_editability(
+    mode: InputMode,
+    password: Option<bool>,
+    strict_editability: impl FnOnce() -> Result<(), InputFailure>,
+) -> Result<(), InputFailure> {
+    match password {
+        Some(false) => {},
+        Some(true) => return Err(failure("input_password_target")),
+        None => return Err(failure("input_password_unknown")),
+    }
+    // Compatibility waives ONLY control classification and writable-pattern metadata.
+    // All focus, identity, privilege, cancellation and desktop gates remain outside this gate.
+    match mode {
+        InputMode::Strict => strict_editability(),
+        InputMode::Compatibility => Ok(()),
+    }
+}
+
 pub fn inject(text: &str) -> Result<(), InputFailure> {
     inject_cancellable(text, Arc::new(AtomicBool::new(false)))
 }
@@ -73,17 +100,37 @@ pub fn inject(text: &str) -> Result<(), InputFailure> {
 /// Cancellation stops future chunks; it cannot retract events already queued by Windows.
 /// Use a fresh token per injection. Never clear/reuse a cancelled token.
 pub fn inject_cancellable(text: &str, cancel: Arc<AtomicBool>) -> Result<(), InputFailure> {
+    inject_cancellable_with_mode(text, cancel, InputMode::Strict, false)
+}
+
+/// Compatibility is an explicit, immutable choice for this injection, not a fallback.
+pub fn inject_cancellable_with_mode(text: &str, cancel: Arc<AtomicBool>, mode: InputMode, press_enter: bool) -> Result<(), InputFailure> {
     ensure_active(&cancel)?;
     validate_text(text)?;
     #[cfg(windows)]
-    { native::inject(text, cancel) }
+    { native::inject(text, cancel, mode, press_enter) }
     #[cfg(not(windows))]
-    { let _ = text; Err(failure("windows_input_unavailable")) }
+    { let _ = (text, mode, press_enter); Err(failure("windows_input_unavailable")) }
+}
+
+/// Invoke only after the complete text phase succeeded. No retry or fallback here.
+#[cfg(any(windows, test))]
+fn finish_with_optional_enter(
+    press_enter: bool,
+    cancel: &AtomicBool,
+    recheck: impl FnOnce() -> Result<(), InputFailure>,
+    post_enter: impl FnOnce() -> Result<(), InputFailure>,
+) -> Result<(), InputFailure> {
+    if !press_enter { return Ok(()); }
+    ensure_active(cancel)?;
+    recheck()?;
+    ensure_active(cancel)?;
+    post_enter()
 }
 
 #[cfg(windows)]
 mod native {
-    use super::{unicode_chunks, ensure_active, InputFailure, failure, with_posting_progress};
+    use super::{finish_with_optional_enter, InputMode, require_nonpassword_and_editability, unicode_chunks, ensure_active, InputFailure, failure, with_posting_progress};
     use std::{ffi::c_void, mem::size_of, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
     use windows::{core::Interface, Win32::{
         Foundation::{CloseHandle, HANDLE, HWND},
@@ -186,7 +233,7 @@ mod native {
         Ok(values)
     }
 
-    unsafe fn focus(automation: &IUIAutomation) -> Result<Focus> {
+    unsafe fn focus(automation: &IUIAutomation, mode: InputMode) -> Result<Focus> {
         interactive_desktop()?;
         for key in [0x10, 0x11, 0x12, 0x5b, 0x5c] {
             require((GetAsyncKeyState(key) as u16 & 0x8000) == 0, "input_modifier_held")?;
@@ -202,29 +249,32 @@ mod native {
         bool_property(&element, UIA_IsEnabledPropertyId, true, "input_enabled_unknown", "input_target_disabled")?;
         bool_property(&element, UIA_HasKeyboardFocusPropertyId, true, "input_focus_state_unknown", "input_target_not_focused")?;
         bool_property(&element, UIA_IsKeyboardFocusablePropertyId, true, "input_focusable_unknown", "input_target_not_focusable")?;
-        bool_property(&element, UIA_IsPasswordPropertyId, false, "input_password_unknown", "input_password_target")?;
-        let control = Variant(element.GetCurrentPropertyValueEx(UIA_ControlTypePropertyId, true).map_err(|_| failure("input_control_type_unknown"))?);
-        let control_type = control.exact_i32().ok_or_else(|| failure("input_control_type_unknown"))?;
-        require(control_type == UIA_EditControlTypeId.0 || control_type == UIA_DocumentControlTypeId.0, "input_unsupported_control")?;
-        // Metadata only: never retrieve target text, titles, process names, Value or selection text.
-        match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
-            Ok(value) => require(!value.CurrentIsReadOnly().map_err(|_| failure("input_editability_unknown"))?.as_bool(), "input_target_readonly")?,
-            Err(_) => {
-                let text = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).map_err(|_| failure("input_unsupported_editability"))?;
-                let range = text.DocumentRange().map_err(|_| failure("input_editability_unknown"))?;
-                let read_only = Variant(range.GetAttributeValue(UIA_IsReadOnlyAttributeId).map_err(|_| failure("input_editability_unknown"))?);
-                match read_only.exact_bool() {
-                    Some(value) => require(!value, "input_target_readonly")?,
-                    None => return Err(failure("input_editability_unknown")),
+        let password = Variant(element.GetCurrentPropertyValueEx(UIA_IsPasswordPropertyId, true).map_err(|_| failure("input_password_unknown"))?);
+        require_nonpassword_and_editability(mode, password.exact_bool(), || {
+            let control = Variant(element.GetCurrentPropertyValueEx(UIA_ControlTypePropertyId, true).map_err(|_| failure("input_control_type_unknown"))?);
+            let control_type = control.exact_i32().ok_or_else(|| failure("input_control_type_unknown"))?;
+            require(control_type == UIA_EditControlTypeId.0 || control_type == UIA_DocumentControlTypeId.0, "input_unsupported_control")?;
+            // Metadata only: never retrieve target text, titles, process names, Value or selection text.
+            match element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
+                Ok(value) => require(!value.CurrentIsReadOnly().map_err(|_| failure("input_editability_unknown"))?.as_bool(), "input_target_readonly")?,
+                Err(_) => {
+                    let text = element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).map_err(|_| failure("input_unsupported_editability"))?;
+                    let range = text.DocumentRange().map_err(|_| failure("input_editability_unknown"))?;
+                    let read_only = Variant(range.GetAttributeValue(UIA_IsReadOnlyAttributeId).map_err(|_| failure("input_editability_unknown"))?);
+                    match read_only.exact_bool() {
+                        Some(value) => require(!value, "input_target_readonly")?,
+                        None => return Err(failure("input_editability_unknown")),
+                    }
                 }
             }
-        }
+            Ok(())
+        })?;
         let runtime_id = runtime_id(&element)?;
         require(GetForegroundWindow() == hwnd, "input_focus_changed")?;
         Ok(Focus { hwnd, pid, runtime_id })
     }
 
-    unsafe fn run(text: &str, cancel: &AtomicBool, posting: &AtomicBool) -> Result<()> {
+    unsafe fn run(text: &str, cancel: &AtomicBool, posting: &AtomicBool, mode: InputMode, press_enter: bool) -> Result<()> {
         ensure_active(cancel)?;
         CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|_| failure("input_automation_unavailable"))?;
         let _apartment = Apartment;
@@ -234,10 +284,10 @@ mod native {
         settings.SetConnectionTimeout(750).map_err(|_| failure("input_automation_unavailable"))?;
         settings.SetTransactionTimeout(750).map_err(|_| failure("input_automation_unavailable"))?;
         let deadline = Instant::now() + Duration::from_secs(3);
-        let initial = focus(&automation)?;
+        let initial = focus(&automation, mode)?;
         for chunk in unicode_chunks(text) {
             ensure_active(cancel)?;
-            let current = focus(&automation)?;
+            let current = focus(&automation, mode)?;
             require(current.hwnd == initial.hwnd && current.pid == initial.pid && current.runtime_id == initial.runtime_id, "input_focus_changed")?;
             if Instant::now() >= deadline { return Err(failure("input_deadline_exceeded")); }
             let mut events = Vec::with_capacity(chunk.len() * 2);
@@ -258,10 +308,28 @@ mod native {
                 return Err(failure("input_posting_unconfirmed"));
             }
         }
-        Ok(())
+        finish_with_optional_enter(press_enter, cancel, || {
+            let current = focus(&automation, mode)?;
+            require(current.hwnd == initial.hwnd && current.pid == initial.pid && current.runtime_id == initial.runtime_id, "input_focus_changed")?;
+            require(Instant::now() < deadline, "input_deadline_exceeded")
+        }, || {
+            // Explicit key event, not a newline appended to the text. Never reached after
+            // a text-phase error or partial count. Focus-to-delivery cannot be atomic.
+            let events = [false, true].map(|up| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0x0d), wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                    ..Default::default()
+                } },
+            });
+            ensure_active(cancel)?;
+            posting.store(true, Ordering::Release);
+            require(SendInput(&events, size_of::<INPUT>() as i32) == events.len() as u32, "input_posting_unconfirmed")
+        })
     }
 
-    pub(super) fn inject(text: &str, cancel: Arc<AtomicBool>) -> Result<()> {
+    pub(super) fn inject(text: &str, cancel: Arc<AtomicBool>, mode: InputMode, press_enter: bool) -> Result<()> {
         ensure_active(&cancel)?;
         if BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return Err(failure("input_busy"));
@@ -273,7 +341,7 @@ mod native {
         // Caller must not run this blocking function on the GUI event loop.
         let worker = std::thread::Builder::new().name("teleport-input".into()).spawn(move || {
             let _busy = BusyGuard;
-            unsafe { run(&text, &cancel, &worker_posting) }.map_err(|error| with_posting_progress(error, &worker_posting))
+            unsafe { run(&text, &cancel, &worker_posting, mode, press_enter) }.map_err(|error| with_posting_progress(error, &worker_posting))
         });
         match worker {
             Ok(worker) => worker.join().unwrap_or_else(|_| Err(with_posting_progress(failure("input_worker_failed"), &posting))),
@@ -285,6 +353,45 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn enter_is_off_by_default_and_only_follows_successful_recheck() {
+        let cancel = AtomicBool::new(false);
+        assert!(finish_with_optional_enter(false, &cancel, || panic!("disabled"), || panic!("disabled")).is_ok());
+        let steps = std::cell::RefCell::new(Vec::new());
+        assert!(finish_with_optional_enter(true, &cancel, || { steps.borrow_mut().push("recheck"); Ok(()) }, || { steps.borrow_mut().push("enter"); Ok(()) }).is_ok());
+        assert_eq!(*steps.borrow(), vec!["recheck", "enter"]);
+        assert_eq!(finish_with_optional_enter(true, &cancel, || Err(failure("input_focus_changed")), || panic!("must not post after guard failure")), Err(failure("input_focus_changed")));
+    }
+    #[test] fn enter_is_not_posted_after_cancellation_or_text_failure() {
+        let cancel = AtomicBool::new(true);
+        assert_eq!(finish_with_optional_enter(true, &cancel, || panic!("already cancelled"), || panic!("already cancelled")), Err(failure("input_cancelled")));
+        cancel.store(false, Ordering::Release);
+        assert_eq!(finish_with_optional_enter(true, &cancel, || { cancel.store(true, Ordering::Release); Ok(()) }, || panic!("cancelled during recheck")), Err(failure("input_cancelled")));
+        fn sequence(cancel: &AtomicBool) -> Result<(), InputFailure> {
+            Err::<(), _>(failure("input_posting_unconfirmed"))?;
+            finish_with_optional_enter(true, cancel, || panic!("text failed"), || panic!("text failed"))
+        }
+        assert_eq!(sequence(&cancel), Err(failure("input_posting_unconfirmed")));
+    }
+    #[test] fn strict_is_default_and_retains_editability_rejections() {
+        assert_eq!(InputMode::default(), InputMode::Strict);
+        for code in ["input_control_type_unknown", "input_unsupported_control", "input_editability_unknown", "input_target_readonly", "input_unsupported_editability"] {
+            assert_eq!(require_nonpassword_and_editability(InputMode::Strict, Some(false), || Err(failure(code))), Err(failure(code)));
+            assert!(require_nonpassword_and_editability(InputMode::Compatibility, Some(false), || panic!("compatibility must not inspect editability")).is_ok());
+        }
+        assert!(require_nonpassword_and_editability(InputMode::Strict, Some(false), || Ok(())).is_ok());
+    }
+    #[test] fn neither_mode_waives_password_or_unknown_password() {
+        for mode in [InputMode::Strict, InputMode::Compatibility] {
+            for (password, code) in [(None, "input_password_unknown"), (Some(true), "input_password_target")] {
+                assert_eq!(require_nonpassword_and_editability(mode, password, || panic!("password gate must run first")), Err(failure(code)));
+            }
+        }
+    }
+    #[test] fn compatibility_still_validates_text_and_cancellation() {
+        assert_eq!(inject_cancellable_with_mode("safe", Arc::new(AtomicBool::new(true)), InputMode::Compatibility, false), Err(failure("input_cancelled")));
+        assert_eq!(inject_cancellable_with_mode("\0", Arc::new(AtomicBool::new(false)), InputMode::Compatibility, false), Err(failure("input_control_refused")));
+        assert_eq!(inject_cancellable_with_mode("", Arc::new(AtomicBool::new(false)), InputMode::Compatibility, false), Err(failure("input_size_refused")));
+    }
     #[test] fn unicode_and_whitespace_are_preserved() {
         let text = "你好 👩🏽‍💻\n下一行\tend\r";
         assert!(validate_text(text).is_ok());

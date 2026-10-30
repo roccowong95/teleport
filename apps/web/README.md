@@ -25,3 +25,9 @@ Browser tests need Chromium and permission to create local sockets. Set `CHROMIU
 Phone status separates connection readiness from the last send result. Disabled-send hints explain missing pairing, manual disconnect, offline/unready/paused states and empty/oversized drafts. While awaiting ACK, the button displays a 15-second countdown. Timeout or interrupted delivery remains unknown, never a retry trigger.
 
 An `injected` ACK only means OS input events were submitted, **not** that the target application received or displayed text. Rejected/unknown outcomes show translated, whitelisted native codes (and their static `[code]` identifiers). Arbitrary exception strings/codes are discarded. ACK status, not an individual error code, determines whether input may have occurred; focus/guard checks can fail after earlier chunks were submitted.
+
+### Optional Enter (alpha4)
+
+“发送后按回车” is default-off and never persisted. The warning explicitly notes that Enter may send a chat message or execute a terminal command. It becomes available only after an owner-authenticated, decrypted `ready` payload advertises `capabilities: { pressEnter: true }`. Legacy or unsupported receivers keep a disabled checkbox with an upgrade hint; ordinary text remains available.
+
+The choice is frozen as the explicit boolean `pressEnter` inside each encrypted text payload, not appended to text as a newline. While waiting for ACK the checkbox is locked; unknown outcomes retain the frozen action warning even if connection/UI state has changed. Loss of capability, pause, disconnect, owner-session change, device change, reset or page reload clears the selection. Typing Enter in the phone textarea still only inserts a newline; it never sends or toggles the option. No action is retried automatically.
