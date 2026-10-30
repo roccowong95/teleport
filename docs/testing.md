@@ -18,3 +18,9 @@
 - No screenshot/visual QA, physical phone or Chinese-network reliability claim.
 
 Run `npm test`, `npm run check`, `npm run build`. Browser commands are in the root README. Run a harmless local text editor test before any sensitive application. Distinguish dry-run adapter acceptance from OS insertion and target application persistence.
+
+## Subsequent Mac test report
+
+The isolated Mac test runner reported all core tests/checks/web build and the four browser UI mock scenarios passing after explicit permission. Full browser→relay E2E awaits a rerun using the existing Chrome executable via `CHROMIUM_PATH`. Native Swift remains blocked: even a minimal AppKit import fails with duplicate SwiftBridging modules in that toolchain, so no native insertion success is claimed.
+
+Electron was raised from 41.10.7 to the exact published patched version 42.11.16 following `npm audit`. The highest advisory, [GHSA-jr5w-w6x2-84p9](https://github.com/electron/electron/security/advisories/GHSA-jr5w-w6x2-84p9), affects certificate revocation in Chromium and Node networking; the official advisory requires an Electron update. Desktop runtime acceptance must be repeated on the new version.

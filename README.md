@@ -27,7 +27,7 @@ npm run dev
 
 For a headless build/test machine that does not run Electron, use `ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci`. `npm run build` builds the web assets, checks desktop JavaScript syntax, then runs a Worker deployment **dry-run**. It does not compile the Swift helper, package/sign Electron or deploy remotely.
 
-Browser acceptance needs Playwright Chromium (`npx playwright install chromium`) and a sandbox capable of running it. `npm run test:browser` runs UI mocks. To test the full UI against the local Worker, run `npm run dev` first, then `npm run test:e2e`. The latter uses an explicitly simulated input adapter and must not be described as a real OS typing test.
+Browser acceptance needs Playwright Chromium (`npx playwright install chromium`) and a sandbox capable of running it. `npm run test:browser` runs UI mocks. To test the full UI against the local Worker, run `npm run dev` first, then `npm run test:e2e`. Set `CHROMIUM_PATH` to an existing Chrome/Chromium executable for either browser suite when you do not want a separate Playwright browser download. The latter uses an explicitly simulated input adapter and must not be described as a real OS typing test.
 
 ## Self-hosting on your Cloudflare account
 

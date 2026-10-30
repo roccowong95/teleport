@@ -9,7 +9,7 @@ async function until(check) { const end=Date.now()+15000; while(!check()) { if(D
 test('real browser → local Cloudflare DO → encrypted desktop mock, persistence and no replay', {timeout:60000}, async () => {
  const texts=[]; let state; const receiver=new Receiver({store:{load:async()=>state,save:async x=>{state=x;}},adapter:new DryRunAdapter(x=>texts.push(x)),WebSocketImpl:WebSocket});
  let pairing; receiver.on('pair-request', x=>{pairing=x;});
- const browser=await chromium.launch({headless:true,chromiumSandbox:true}); const context=await browser.newContext({viewport:{width:390,height:844},isMobile:true}); const page=await context.newPage();
+ const browser=await chromium.launch({headless:true,chromiumSandbox:true,...(process.env.CHROMIUM_PATH ? {executablePath:process.env.CHROMIUM_PATH} : {})}); const context=await browser.newContext({viewport:{width:390,height:844},isMobile:true}); const page=await context.newPage();
  const errors=[]; page.on('pageerror',e=>errors.push(e.message));
  try {
   await receiver.initialize(); await receiver.setup(endpoint,'Cloud test desktop'); await until(()=>receiver.connected);
