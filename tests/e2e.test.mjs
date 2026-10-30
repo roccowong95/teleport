@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import WebSocket from 'ws';
 import { Receiver } from '../apps/desktop/src/controller.mjs';
 import { DryRunAdapter } from '../apps/desktop/src/adapters.mjs';
@@ -17,15 +17,15 @@ test('real browser → local Cloudflare DO → encrypted desktop mock, persisten
   await page.locator('#sas').waitFor({state:'visible'}); assert.equal(await page.locator('#sas').innerText(),pairing.sas);
   await receiver.approve(pairing.deviceId,true); await until(()=>!!receiver.state.peers[pairing.deviceId]);
   await page.locator('#draft').fill('你好，Teleport 👩🏽‍💻\n第二行 — café');
-  assert.equal(await page.locator('#send').isDisabled(),true); await receiver.pause(false);
+  await expect(page.locator('#send')).toBeDisabled(); await receiver.pause(false);
   await page.locator('#send').click(); await page.getByText('已输入到电脑。',{exact:false}).waitFor();
   assert.deepEqual(texts,['你好，Teleport 👩🏽‍💻\n第二行 — café']); assert.equal(await page.locator('#draft').inputValue(),texts[0]);
   await page.screenshot({path:'test-results/phone-connected.png',fullPage:true});
   await page.reload(); await page.locator('#status').filter({hasText:'已安全连接'}).waitFor(); assert.equal(texts.length,1);
   await page.locator('#draft').fill('重连以后，手动发送'); await page.locator('#send').click(); await until(()=>texts.length===2);
-  await page.locator('#connect').click(); assert.equal(await page.locator('#send').isDisabled(),true);
+  await page.locator('#connect').click(); await expect(page.locator('#send')).toBeDisabled();
   await page.locator('#connect').click(); await page.locator('#status').filter({hasText:'已安全连接'}).waitFor(); assert.equal(texts.length,2);
   page.on('dialog', d=>d.accept()); await page.locator('#forget').click(); await until(()=>Object.keys(receiver.state.peers).length===0);
-  assert.equal(await page.locator('#send').isDisabled(),true); assert.deepEqual(errors,[]);
+  await expect(page.locator('#send')).toBeDisabled(); assert.deepEqual(errors,[]);
  } finally { receiver.stop(); if(receiver.state) await receiver.request(`/${receiver.state.roomId}`,null,'DELETE').catch(()=>{}); await browser.close(); }
 });

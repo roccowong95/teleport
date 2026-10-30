@@ -62,3 +62,19 @@ test('QR fragment is removed immediately, pairing is explicit, pending cannot se
  await page.screenshot({path:'artifacts/phone-desktop.png',fullPage:true});
  }finally{await context.close();}
 });
+
+test('forget disables sending immediately while server revocation is still pending',async()=>{
+ const t=await setup();let finish;
+ const response=new Promise(resolve=>{finish=resolve;});
+ try {
+  await t.page.route('**/api/rooms/*/devices/*',async route=>{await response;await route.fulfill({json:{ok:true}});});
+  await t.page.locator('#draft').fill('不要在撤销中发送');
+  await t.page.waitForFunction(()=>!document.querySelector('#send').disabled);
+  t.page.on('dialog',d=>d.accept());
+  await t.page.locator('#forget').click();
+  await t.page.waitForFunction(()=>document.querySelector('#send').disabled);
+  assert.equal(t.relays.length,0);
+  finish();
+  await t.page.waitForFunction(()=>document.querySelector('#device-panel').hidden);
+ }finally{finish();await t.context.close();}
+});

@@ -141,7 +141,7 @@ $('connect').onclick = () => { if (!active) return; active.enabled = !active.ena
 $('devices').onchange = () => { stop(); active = devices.find(d => d.deviceId === $<HTMLSelectElement>('devices').value)!; sasCode = ''; status = '尚未连接'; if (active.enabled) connect(); update(); };
 $('forget').onclick = async () => {
  const d = active; if (!d || !confirm(`忘记「${d.name}」？将尝试撤销电脑端授权，并删除此浏览器中的配对密钥。`)) return;
- stop(); d.enabled = false;
+ stop(); d.enabled = false; status = '正在忘记设备…'; update();
  let revoked = false;
  try { const r = await fetch(`${d.endpoint}/api/rooms/${encodeURIComponent(d.roomId)}/devices/${encodeURIComponent(d.deviceId)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${d.clientToken}` }, credentials: 'omit', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(8000) }); revoked = r.ok || r.status === 404; } catch { /* Local forgetting remains available offline. */ }
  devices = devices.filter(item => item !== d); active = devices[0]; save(); sasCode = ''; status = '尚未连接'; result = revoked ? '已撤销授权，并删除此浏览器的配对密钥。' : '已删除本地配对密钥，但未确认服务器撤销。请在电脑端删除该设备。'; update(); if (active?.enabled) connect();
