@@ -10,10 +10,10 @@ if (!ownsInstance) app.quit();
 else app.whenReady().then(async () => {
   const { Receiver } = await import('./controller.mjs');
   const { EncryptedStore } = await import('./store.mjs');
-  const { MacAdapter, DryRunAdapter, UnsupportedAdapter } = await import('./adapters.mjs');
+  const { MacAdapter, WindowsAdapter, DryRunAdapter, UnsupportedAdapter } = await import('./adapters.mjs');
   const { default: WebSocket } = await import('ws');
   const QRCode = require('qrcode');
-  receiver = new Receiver({store:new EncryptedStore(path.join(app.getPath('userData'),'identity.enc'),safeStorage),adapter:process.env.TELEPORT_DRY_RUN === '1' ? new DryRunAdapter() : process.platform === 'darwin' ? new MacAdapter() : new UnsupportedAdapter(),WebSocketImpl:WebSocket});
+  receiver = new Receiver({store:new EncryptedStore(path.join(app.getPath('userData'),'identity.enc'),safeStorage),adapter:process.env.TELEPORT_DRY_RUN === '1' ? new DryRunAdapter() : process.platform === 'darwin' ? new MacAdapter() : process.platform === 'win32' ? new WindowsAdapter() : new UnsupportedAdapter(),WebSocketImpl:WebSocket});
   window = new BrowserWindow({width:520,height:730,show:false,webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
   window.webContents.setWindowOpenHandler(() => ({action:'deny'}));
   window.webContents.on('will-navigate', event => event.preventDefault());

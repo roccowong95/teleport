@@ -1,0 +1,153 @@
+name: Test, package and prerelease
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: teleport-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          node scripts/release-plan.mjs >> "$GITHUB_OUTPUT"
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm audit --audit-level=high
+      - run: npm run check
+      - run: npm test
+      - run: npm run test:ci-config
+      - run: npm run build
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - name: Actual browser, local Worker/DO, simulated receiver
+        shell: bash
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          npm run dev -w @teleport/relay -- --ip 127.0.0.1 --port 8787 > /tmp/teleport-relay.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/ >/dev/null
+          npm run test:e2e
+  desktop:
+    needs: [plan, core]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TELEPORT_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '10.0.x'
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - name: Verify native runner architecture
+        run: node -e "if(process.arch!=='${{ matrix.arch }}')throw Error('Wrong runner architecture')"
+      - run: npm run test -w @teleport/desktop
+      - run: npm run build:mac-helper -w @teleport/desktop
+        if: runner.os == 'macOS'
+      - run: npm run build:windows-helper -w @teleport/desktop
+        if: runner.os == 'Windows'
+      - run: npm run package:desktop
+      - name: Archive macOS unsigned app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent artifacts/desktop/Teleport-darwin-arm64/Teleport.app artifacts/Teleport-macos-arm64.zip
+      - name: Archive Windows unsigned portable app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path artifacts/desktop/Teleport-win32-x64/* -DestinationPath artifacts/Teleport-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Teleport-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/Teleport-*.zip
+          if-no-files-found: error
+          retention-days: 3
+  release:
+    needs: [plan, core, desktop]
+    if: needs.plan.outputs.release == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Teleport-*
+          merge-multiple: true
+          path: release-assets
+      - name: Checksums and immutable prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          cd release-assets
+          sha256sum *.zip > SHA256SUMS.txt
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing asset replacement.' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/tags/* ]] && git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo 'Tag already exists; refusing to retarget.' >&2
+            exit 1
+          fi
+          gh release create "$VERSION" ./*.zip SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION (unsigned preview)" --notes "Built from $GITHUB_SHA after all CI checks. macOS arm64 and Windows x64 previews are unsigned and macOS is not notarized. Build/tests do not grant Accessibility permissions or establish real focused-input acceptance. No Cloudflare deployment, signing credentials or automatic update channel. Verify SHA256SUMS.txt before manual testing."

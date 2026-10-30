@@ -51,3 +51,7 @@ The desktop device list supports individual revocation. **Delete room & reset** 
 **Disconnect** (window or tray menu) closes the WebSocket and cancels reconnect attempts without deleting pairings. **Connect to relay** explicitly reconnects with a fresh session. This is distinct from Pause, which keeps the connection online but rejects text.
 
 The active helper source is `native/TeleportInput.m`; the former Swift source is retained only for reference and is not built. This avoids a Swift-module toolchain failure observed even on a minimal AppKit import, without modifying system SDK files. `native/teleport-input --check-access` reports `access_available` or `access_required` and does not request/change permissions. Exit success here is not a focus/input acceptance test.
+
+## Windows preview
+
+Windows source uses a self-contained .NET helper with UIAutomation and Unicode SendInput; Electron launches it silently with text on stdin only. No clipboard, shell interpolation, administrator request or UIAccess bypass. Read [Windows acceptance](../../docs/windows-testing.md). Source/adapter tests are not proof of native compatibility. Copy the **entire** published `native/windows` runtime folder when packaging; do not copy only the EXE.

@@ -13,9 +13,12 @@
     "test:browser": "npm run test:browser -w @teleport/web",
     "build": "npm run build -w @teleport/web && npm run build -w @teleport/desktop && npm run build -w @teleport/relay",
     "check": "npm run check --workspaces --if-present",
-    "dev": "npm run dev -w @teleport/relay"
+    "dev": "npm run dev -w @teleport/relay",
+    "package:desktop": "node scripts/package-desktop.mjs",
+    "test:ci-config": "node --test scripts/ci-config.test.mjs"
   },
   "devDependencies": {
+    "@electron/packager": "20.3.0",
     "@playwright/test": "^1.56.0",
     "miniflare": "5.20261023.3-beta",
     "ws": "^8.18.0"

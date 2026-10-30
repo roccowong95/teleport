@@ -11,3 +11,8 @@ test-results/
 
 # Native build output
 apps/desktop/native/teleport-input
+
+# Windows native publish/intermediate output
+apps/desktop/native/windows/
+apps/desktop/native/obj/
+apps/desktop/native/bin/

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 function run(command, args, input, spawnImpl = spawn) {
   return new Promise((resolve, reject) => {
-    const child = spawnImpl(command, args, { stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+    const child = spawnImpl(command, args, { stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
     let output = ''; const timer = setTimeout(() => { child.kill(); reject(new Error('injection_timeout')); }, 3000);
     child.stdout.on('data', data => { if (output.length < 4096) output += data; });
     child.stderr.on('data', () => {}); // Never log text or subprocess input.
@@ -20,6 +20,11 @@ export class MacAdapter {
   label = 'Focused editable field (macOS)';
   constructor(helper = fileURLToPath(new URL('../native/teleport-input', import.meta.url))) { this.helper = helper; }
   async inject(text) { await run(this.helper, [], text); return { status: 'injected' }; }
+}
+export class WindowsAdapter {
+  label = 'Focused editable field (Windows preview)';
+  constructor(helper = fileURLToPath(new URL('../native/windows/teleport-input.exe', import.meta.url)), {spawnImpl = spawn} = {}) { this.helper = helper; this.spawnImpl = spawnImpl; }
+  async inject(text) { await run(this.helper, [], text, this.spawnImpl); return {status:'injected'}; }
 }
 export class TmuxAdapter {
   constructor(pane, { optIn = false, spawnImpl = spawn } = {}) {

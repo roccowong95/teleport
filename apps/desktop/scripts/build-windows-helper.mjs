@@ -1,0 +1,10 @@
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve, sep } from 'node:path';
+import { parseArgs } from 'node:util';
+const { values } = parseArgs({ options: { rid: {type:'string'} } });
+const defaultRID = process.platform === 'win32' ? (process.arch === 'arm64' ? 'win-arm64' : process.arch === 'x64' ? 'win-x64' : undefined) : undefined;
+const rid = values.rid || defaultRID;
+if (!['win-x64','win-arm64'].includes(rid)) throw new Error('Supply --rid win-x64 or --rid win-arm64 for cross-compilation. A successful cross-build is not a Windows runtime test.');
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+execFileSync(process.env.DOTNET_BIN || 'dotnet', ['publish', resolve(root,'native/TeleportInput.Windows.csproj'), '-c','Release','-r',rid,'--self-contained','true','-o',resolve(root,'native/windows'), '-p:BaseIntermediateOutputPath=' + resolve(root,'.local/windows-obj', rid) + sep], {stdio:'inherit'});

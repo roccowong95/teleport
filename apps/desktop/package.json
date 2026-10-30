@@ -6,11 +6,12 @@
   "main": "src/main.cjs",
   "scripts": {
     "start": "electron .",
-    "build": "node --check src/main.cjs && node --check src/controller.mjs && node --check src/adapters.mjs && node --check src/renderer.js && node --check src/headless.mjs && node --check src/store.mjs && node --check src/preload.cjs && node --check src/ipc-guard.cjs && node --check scripts/build-mac-helper.mjs",
+    "build": "node --check src/main.cjs && node --check src/controller.mjs && node --check src/adapters.mjs && node --check src/renderer.js && node --check src/headless.mjs && node --check src/store.mjs && node --check src/preload.cjs && node --check src/ipc-guard.cjs && node --check scripts/build-mac-helper.mjs && node --check scripts/build-windows-helper.mjs",
     "check": "npm run build",
     "test": "node --test test/*.test.mjs",
     "build:mac-helper": "node scripts/build-mac-helper.mjs",
-    "headless": "node src/headless.mjs"
+    "headless": "node src/headless.mjs",
+    "build:windows-helper": "node scripts/build-windows-helper.mjs"
   },
   "dependencies": {
     "@teleport/protocol": "0.1.0",

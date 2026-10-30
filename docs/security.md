@@ -16,7 +16,7 @@ The relay sees routing IDs, timing, sizes and availability, can drop/delay traff
 
 Global focus injection has a final-check/event-delivery race. macOS helper refuses secure/unsupported AX fields, but this is defense in depth, not a guarantee against every sensitive application. Payload newline/tab may be interpreted by applications even without synthesized Return keys. Partial injection is possible. Never automatically retry unknown outcomes. Restart/session rotation rejects old messages rather than claiming crash-proof exactly-once semantics.
 
-Terminal support is **WIP**: explicit tmux pane, opt-in, literal single-line send, no Enter, no shell interpolation; control characters/newlines are refused. This does not establish arbitrary terminal safety or foreground detection. Windows injection is not implemented.
+Terminal support is **WIP**: explicit tmux pane, opt-in, literal single-line send, no Enter, no shell interpolation; control characters/newlines are refused. This does not establish arbitrary terminal safety or foreground detection. Windows preview uses UIAutomation editable/password/focus checks plus process integrity/UIPI constraints and Unicode SendInput; unsupported providers and elevated targets beyond receiver integrity are refused. Real Windows runtime acceptance remains pending.
 
 ## Before production
 

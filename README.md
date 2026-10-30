@@ -2,7 +2,7 @@
 
 Send text from your phone's browser/keyboard to the focused input on your computer. No account. Pair by QR, compare a security code, approve on the computer, and keep trusted devices for later.
 
-**Early MVP source, not a production-ready or signed app.** Cloud protocol and local Cloudflare runtime tests pass; real macOS input and browser acceptance are still pending. Windows input is not implemented. Linux tmux is an explicit-target, single-line WIP, not global focus injection.
+**Early MVP source, not a production-ready or signed app.** Cloud protocol and local Cloudflare runtime tests pass; real macOS input and browser acceptance are still pending. Windows input helper source is implemented as a preview, with real Windows build/runtime acceptance pending. Linux tmux is an explicit-target, single-line WIP, not global focus injection.
 
 ## Monorepo
 
