@@ -12,7 +12,7 @@ export function createMacSigningOptions(outputDirectory) {
     const filename=role==='main'?'default.darwin.plist':`default.darwin.${role}.plist`;
     const original=readFileSync(join(defaults,filename),'utf8');
     if((original.match(/<\/dict>/g)||[]).length!==1)throw Error('Unexpected Electron entitlement format');
-    const amended=original.replace('</dict>','  <key>com.apple.security.cs.disable-library-validation</key>\n    <true/>\n  </dict>');
+    const amended=original.includes('<key>com.apple.security.cs.disable-library-validation</key>') ? original : original.replace('</dict>','  <key>com.apple.security.cs.disable-library-validation</key>\n    <true/>\n  </dict>');
     files[role]=join(outputDirectory,filename);writeFileSync(files[role],amended);
   }
   return {
