@@ -9,3 +9,5 @@ test('native packaging refuses unsupported host without producing artifacts',()=
 test('workflow uses standard runners and limited release privilege',()=>{const source=readFileSync('.github/workflows/ci.yml','utf8');assert.doesNotMatch(source,/macos-\S*(?:large|xlarge)|self-hosted/);assert.equal((source.match(/contents: write/g)||[]).length,1);assert.match(source,/retention-days: 3/);});
 
 test('macOS signing is ad-hoc only and preserves standard Electron per-helper defaults',async()=>{const {macSigningOptions}=await import('./macos-signing.mjs');assert.equal(macSigningOptions.identity,'-');assert.equal(macSigningOptions.identityValidation,false);assert.equal(macSigningOptions.continueOnError,false);assert.deepEqual(macSigningOptions.optionsForFile('helper'),{timestamp:'none'});assert.equal(macSigningOptions.entitlements,undefined);assert.equal(macSigningOptions.additionalArguments,undefined);});
+
+test('staged package supplies required Windows publisher metadata',()=>{assert.match(readFileSync('scripts/package-desktop.mjs','utf8'),/author:'Teleport contributors'/);});

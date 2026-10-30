@@ -15,7 +15,7 @@ await rm(stage,{recursive:true,force:true});await mkdir(stage,{recursive:true});
 await cp(join(appSource,'src'),join(stage,'src'),{recursive:true});
 const helper=platform==='darwin'?'native/teleport-input':'native/windows';
 await access(join(appSource,helper));await cp(join(appSource,helper),join(stage,helper),{recursive:true});
-await import('node:fs/promises').then(fs=>fs.writeFile(join(stage,'package.json'),JSON.stringify({name:'teleport',productName:'Teleport',version,type:'module',main:'src/main.cjs',description:'Phone-to-desktop encrypted text input',dependencies:appPackage.dependencies},null,2)));
+await import('node:fs/promises').then(fs=>fs.writeFile(join(stage,'package.json'),JSON.stringify({name:'teleport',productName:'Teleport',version,type:'module',main:'src/main.cjs',description:'Phone-to-desktop encrypted text input',author:'Teleport contributors',dependencies:appPackage.dependencies},null,2)));
 // Copy the exact npm-ci-installed production dependency closure. No second resolution/install.
 // Fail rather than silently flatten incompatible versions.
 const copied=new Map();
