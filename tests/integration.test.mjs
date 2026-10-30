@@ -20,10 +20,10 @@ test('actual DO + desktop controller + phone protocol: encrypted Unicode, SAS, d
  const res=await fetchImpl(`https://localhost/api/rooms/${pair.roomId}/pair`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pairToken:pair.pairToken,deviceId,clientToken,publicKey:identity.publicKey,name:'Test phone'})});assert.equal(res.status,200);await until(()=>pending);assert.equal(pending.sas,await sas(identity.secretKey,pair.ownerPublicKey,pair.roomId));
  let ready,acks=[];phone=new Socket(`wss://localhost/api/rooms/${pair.roomId}/ws`);phone.on('open',()=>phone.send(JSON.stringify({type:'auth',role:'sender',deviceId,token:clientToken})));phone.on('message',d=>{const m=JSON.parse(d);if(m.type==='data'){const p=open(m.envelope,{roomId:pair.roomId,sender:'owner',recipient:deviceId},pair.ownerPublicKey,identity.secretKey);if(p.kind==='ready')ready=p;else acks.push(p);}});
  await until(()=>phone.readyState===1);await receiver.approve(deviceId,true);await until(()=>ready);assert.equal(ready.paused,true);await receiver.pause(false);await until(()=>!ready.paused);
- const payload={kind:'text',id:randomUUID(),sessionId:ready.sessionId,text:'中文 👩🏽‍💻\nsecond line',sentAt:Date.now(),expiresAt:Date.now()+15000};
+ const sentAt=Date.now();const payload={kind:'text',id:randomUUID(),sessionId:ready.sessionId,text:'中文 👩🏽‍💻\nsecond line',sentAt,expiresAt:sentAt+15000};
  const send=p=>phone.send(JSON.stringify({type:'relay',to:'owner',envelope:seal(p,{roomId:pair.roomId,sender:deviceId,recipient:'owner'},pair.ownerPublicKey,identity.secretKey)}));
- send(payload);await until(()=>acks.length===1);assert.equal(acks[0].status,'injected');assert.deepEqual(texts,[payload.text]);send(payload);await until(()=>acks.length===2);assert.equal(acks[1].status,'rejected');assert.equal(texts.length,1);
- const old=ready.sessionId;receiver.connect();await until(()=>ready.sessionId!==old);send({...payload,id:randomUUID()});await until(()=>acks.length===3);assert.equal(acks[2].status,'rejected');assert.equal(texts.length,1);
+ send(payload);await until(()=>acks.length===1);assert.equal(acks[0].status,'injected',JSON.stringify(acks[0]));assert.deepEqual(texts,[payload.text]);send(payload);await until(()=>acks.length===2);assert.equal(acks[1].status,'rejected');assert.equal(texts.length,1);
+ const old=ready.sessionId;receiver.connect();await until(()=>ready.sessionId!==old);assert.equal(ready.paused,true);send({...payload,id:randomUUID()});await until(()=>acks.length===3);assert.equal(acks[2].status,'rejected');assert.equal(texts.length,1);
  await receiver.revoke(deviceId);assert.equal(Object.keys(receiver.state.peers).length,0);
  }finally{receiver.stop();phone?.close();await mf.dispose();}
 });
