@@ -1,0 +1,17 @@
+{
+  "identifier": "dev.teleport.macos.lightweight",
+  "version": "0.3.0-alpha.1",
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-"
+    }
+  }
+}

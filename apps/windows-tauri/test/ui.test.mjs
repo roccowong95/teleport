@@ -14,8 +14,8 @@ async function fixture(options={}){
   const document={getElementById:$,createElement:()=>new Element(),addEventListener:(name,fn)=>documentEvents.set(name,fn),removeEventListener:name=>documentEvents.delete(name)};
   const invoke=async(command,args)=>{calls.push({command,args});if(options.invoke){const custom=await options.invoke(command,args);if(custom!==undefined)return custom;}if(command==='status')return state;if(command==='pause')state={...state,paused:args.paused};if(command==='set_input_mode')state={...state,inputMode:args.mode,paused:true};if(command==='reset')state={...state,configured:false,connected:false,paused:true};if(command==='pairing')return {url:'https://relay.test/#pair=secret',expiresAt:2000};};
   const mounted=await mountReceiver({document,invoke,listen:async(name,fn)=>{events.set(name,fn);return()=>events.delete(name);},drawQR:options.drawQR||(async()=>{}),now:()=>1000,setTimer:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimer:id=>timers.delete(id)});
-  calls.length=0;
-  return {$,calls,timers,documentEvents,mounted,emit:(name,payload)=>events.get(name)({payload}),setState:value=>{state=value;}};
+  const startupCalls=[...calls];calls.length=0;
+  return {$,calls,startupCalls,timers,documentEvents,mounted,emit:(name,payload)=>events.get(name)({payload}),setState:value=>{state=value;}};
 }
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};}
 test('startup is read-only and displays paused status; explicit resume sends narrow command',async()=>{const f=await fixture();assert.match(f.$('connection').textContent,/Input paused/);assert.deepEqual(f.calls,[]);await f.$('pause').onclick();assert.deepEqual(f.calls[0],{command:'pause',args:{paused:false}});assert.match(f.$('connection').textContent,/Input enabled/);});
@@ -47,7 +47,7 @@ test('classified transport failures render exact reviewed codes and WebSocket no
   for(const code of ['relay_timeout','relay_request_invalid','relay_response_invalid','relay_tls_failed','relay_dns_failed','relay_proxy_failed','relay_connect_failed','relay_websocket_failed','relay_websocket_http_403']){const f=await fixture({invoke:command=>{if(command==='setup')throw code;}});await f.$('setupForm').onsubmit({preventDefault(){}});assert.ok(f.$('notice').textContent.includes(`[${code}]`));f.emit('notice',code);assert.ok(f.$('notice').textContent.includes(`[${code}]`));}
   const f=await fixture();f.emit('notice','relay_tls_failed TOP_SECRET');assert.doesNotMatch(f.$('notice').textContent,/TOP_SECRET/);
 });
-test('submitted input means OS events only, never verified target text or save',async()=>{const f=await fixture();f.emit('input-result',{status:'submitted'});assert.match(f.$('notice').textContent,/Input diagnostic — submitted/);assert.match(f.$('notice').textContent,/Windows accepted the input events/);assert.match(f.$('notice').textContent,/does not verify.*target app accepted or saved/);});
+test('submitted input means OS events only, never verified target text or save',async()=>{const f=await fixture();f.emit('input-result',{status:'submitted'});assert.match(f.$('notice').textContent,/Input diagnostic — submitted/);assert.match(f.$('notice').textContent,/The OS input events were submitted/);assert.match(f.$('notice').textContent,/does not verify.*target app accepted or saved/);});
 test('same native failure renders rejected or potentially partial solely from backend outcome status',async()=>{const f=await fixture();f.emit('input-result',{status:'rejected',code:'input_focus_changed'});assert.match(f.$('notice').textContent,/Input diagnostic — rejected \[input_focus_changed\]/);f.emit('input-result',{status:'unknown',code:'input_focus_changed'});assert.match(f.$('notice').textContent,/Input diagnostic — unknown/);assert.match(f.$('notice').textContent,/Some or all text may already have been entered/);assert.match(f.$('notice').textContent,/does not automatically resend/);assert.doesNotMatch(f.$('notice').textContent,/nothing was|no text was|no input was/);assert.deepEqual(f.calls,[]);});
 test('input diagnostics whitelist codes and discard target titles, text, identifiers and malformed statuses',async()=>{const f=await fixture();for(const payload of [{status:'unknown',code:'input_posting_unconfirmed',text:'SECRET_TEXT',title:'PRIVATE_WINDOW',id:'PRIVATE_ID'},{status:'unknown',code:'input_focus_changed SECRET_TEXT',title:'PRIVATE_WINDOW'},{status:'SECRET_TEXT',code:'UNSAFE_PRIVATE_WINDOW'},'SECRET_TEXT']){f.emit('input-result',payload);assert.match(f.$('notice').textContent,/Input diagnostic — unknown/);assert.doesNotMatch(f.$('notice').textContent,/SECRET_TEXT|PRIVATE_WINDOW|PRIVATE_ID/);} });
 test('notice-only native error does not imply zero input; password and elevation guards remain explicit',async()=>{const f=await fixture();f.emit('notice','input_focus_changed');assert.match(f.$('notice').textContent,/Some or all text may already have been entered/);f.emit('input-result',{status:'rejected',code:'input_password_target'});assert.match(f.$('notice').textContent,/Password fields are blocked/);f.emit('input-result',{status:'rejected',code:'input_target_elevated'});assert.match(f.$('notice').textContent,/do not bypass this guard/);});
@@ -61,3 +61,40 @@ test('failed compatibility enable keeps strict display and safe error until user
 test('input and compatibility guidance disclose phone-requested optional Enter without promising no Enter',async()=>{const html=await readFile(new URL('../index.html',import.meta.url),'utf8');assert.match(html,/no implicit Enter; the phone can explicitly request an optional Enter/);assert.match(html,/There is no implicit Enter; the phone can explicitly request an optional Enter/);assert.doesNotMatch(html,/adds no Enter|No clipboard, extra Enter/);});
 
 test('unknown input conditionally warns that an explicitly requested Enter may have posted',async()=>{const f=await fixture();f.emit('input-result',{status:'unknown',code:'input_posting_unconfirmed'});assert.match(f.$('notice').textContent,/If this request included Enter, it may also have been posted/);assert.doesNotMatch(f.$('notice').textContent,/Enter was sent|Enter was posted/);});
+
+const macState={...initial,platform:'macos',permissions:{accessibility:'denied',postEvent:'unknown'}};
+test('macOS permissions are visible before setup, startup is read-only and Windows remains unchanged',async()=>{
+  const f=await fixture({state:{...macState,configured:false,connected:false}});
+  assert.equal(f.$('permissions').hidden,false);assert.equal(f.$('platform').textContent,'macOS');
+  assert.deepEqual(f.startupCalls,[{command:'status',args:undefined}]);
+  assert.match(f.$('permissionStatus').textContent,/not granted.*unknown/);
+  const win=await fixture({state:{...initial,platform:'windows'}});assert.equal(win.$('permissions').hidden,true);assert.equal(win.$('pause').disabled,false);
+  await win.$('requestAccessibility').onclick();assert.deepEqual(win.calls,[]);
+});
+test('macOS Resume fails closed for denied, missing and malformed permission status without prompting',async()=>{
+  for(const permissions of [undefined,{}, {accessibility:'granted',postEvent:'denied'},{accessibility:true,postEvent:'granted'}]){
+    const f=await fixture({state:{...macState,permissions}});assert.equal(f.$('pause').disabled,true);
+    await f.$('pause').onclick();assert.deepEqual(f.calls,[]);assert.match(f.$('notice').textContent,/macos_permissions_required/);
+  }
+  const f=await fixture({state:{...macState,paused:false}});assert.equal(f.$('pause').disabled,false);await f.$('pause').onclick();assert.equal(f.calls[0].command,'pause');assert.equal(f.calls[0].args.paused,true);
+});
+test('macOS permission refresh is read-only and enables Resume only when both checks are granted',async()=>{
+  const f=await fixture({state:macState,invoke:command=>command==='permissions'?{accessibility:'granted',postEvent:'granted'}:undefined});
+  await f.$('refreshPermissions').onclick();assert.deepEqual(f.calls,[{command:'permissions',args:undefined}]);assert.equal(f.$('pause').disabled,false);
+  await f.$('pause').onclick();assert.deepEqual(f.calls[1],{command:'pause',args:{paused:false}});assert.equal(f.calls.some(c=>c.command==='request_permission'),false);
+});
+test('permission request requires explicit click, deduplicates while pending and dismissed request does not grant access',async()=>{
+  const wait=deferred();const f=await fixture({state:macState,invoke:command=>command==='request_permission'?wait.promise:undefined});
+  const request=f.$('requestAccessibility').onclick();await f.$('requestAccessibility').onclick();await f.$('requestPostEvent').onclick();
+  assert.deepEqual(f.calls,[{command:'request_permission',args:{kind:'accessibility'}}]);assert.equal(f.$('requestPostEvent').disabled,true);
+  wait.resolve({accessibility:'denied',postEvent:'denied'});await request;assert.equal(f.$('pause').disabled,true);assert.equal(f.$('requestPostEvent').disabled,false);
+  await f.$('requestPostEvent').onclick();assert.deepEqual(f.calls.filter(c=>c.command==='request_permission')[1],{command:'request_permission',args:{kind:'postEvent'}});
+});
+test('failed refresh marks previously granted permissions unknown and suppresses private error details',async()=>{
+  const f=await fixture({state:{...macState,permissions:{accessibility:'granted',postEvent:'granted'}},invoke:command=>{if(command==='permissions')throw 'PRIVATE_TOKEN/path';}});
+  assert.equal(f.$('pause').disabled,false);await f.$('refreshPermissions').onclick();assert.equal(f.$('pause').disabled,true);assert.match(f.$('permissionStatus').textContent,/unknown/);assert.doesNotMatch(f.$('notice').textContent,/PRIVATE_TOKEN|path/);assert.equal(f.$('refreshPermissions').disabled,false);
+});
+test('older permission refresh cannot replace a newer denied backend status',async()=>{
+  const wait=deferred();const f=await fixture({state:macState,invoke:command=>command==='permissions'?wait.promise:undefined});
+  const refresh=f.$('refreshPermissions').onclick();f.emit('status',macState);wait.resolve({accessibility:'granted',postEvent:'granted'});await refresh;assert.equal(f.$('pause').disabled,true);assert.match(f.$('permissionStatus').textContent,/not granted/);
+});

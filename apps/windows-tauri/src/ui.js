@@ -30,7 +30,11 @@ const ERROR_DETAILS = new Map([
   ['relay_response_too_large','The relay response exceeded the allowed size.'],
   ['invalid_room','The relay did not return a valid room identifier.'],
   ['invalid_roomId','The relay response was missing its room identifier.'],
-  ['secure_storage_unavailable','Windows secure credential encryption was unavailable. No plaintext fallback is used.'],
+  ['secure_storage_unavailable','OS secure credential encryption was unavailable. No plaintext fallback is used.'],
+  ['macos_permissions_required','macOS Accessibility and event-posting access must both be granted before resuming. Use the explicit permission controls and refresh.'],
+  ['invalid_permission_kind','The requested permission was not recognized.'],
+  ['permission_request_failed','The permission request could not be confirmed. Refresh permissions and check macOS System Settings.'],
+  ['macos_secure_storage_required','This receiver requires macOS Keychain-backed credential storage.'],
   ['windows_secure_storage_required','This receiver requires Windows secure credential storage.'],
   ['secure_store_directory_failed','The secure credential directory could not be created.'],
   ['secure_store_write_failed','Encrypted credentials could not be written.'],
@@ -62,13 +66,17 @@ const INPUT_DETAILS = new Map([
   ['input_cancelled','Input was cancelled by a newer stop or safety action.'],
   ['input_size_refused','The text size was refused by the native input guard.'],
   ['input_control_refused','Control characters were refused by the native input guard.'],
+  ['macos_input_unavailable','Native macOS input is unavailable in this environment.'],
+  ['input_permission_required','macOS input permission is not granted. Use the explicit permission controls and refresh; no access is requested automatically.'],
+  ['input_accessibility_required','macOS Accessibility access is required. Use the explicit permission controls, then refresh.'],
+  ['input_post_event_required','macOS event-posting access is required. Use the explicit permission controls, then refresh.'],
   ['windows_input_unavailable','Native Windows input is unavailable in this environment.'],
   ['input_desktop_unavailable','A supported interactive Windows desktop could not be verified.'],
   ['input_integrity_unknown','The target security level could not be verified.'],
   ['input_target_elevated','The target runs at a higher security level. Use a normal, non-elevated target; do not bypass this guard.'],
-  ['input_modifier_held','Release Shift, Ctrl, Alt and Windows keys before trying again.'],
+  ['input_modifier_held','Release Shift, Ctrl, Alt/Option and Windows/Command keys before trying again.'],
   ['input_foreground_unavailable','The foreground target could not be verified.'],
-  ['input_focus_unavailable','Windows accessibility could not identify the focused target.'],
+  ['input_focus_unavailable','Platform accessibility could not identify the focused target.'],
   ['input_focus_pid_mismatch','The focused element did not match the foreground application.'],
   ['input_enabled_unknown','The target enabled state could not be verified.'],
   ['input_target_disabled','The target control is disabled.'],
@@ -76,18 +84,18 @@ const INPUT_DETAILS = new Map([
   ['input_target_not_focused','The target does not have keyboard focus.'],
   ['input_focusable_unknown','The target focusability could not be verified.'],
   ['input_target_not_focusable','The target cannot receive keyboard focus.'],
-  ['input_password_unknown','Windows did not establish that the target is a non-password field. The safety guard remains active.'],
+  ['input_password_unknown','The platform did not establish that the target is a non-password field. The safety guard remains active.'],
   ['input_password_target','Password fields are blocked. Choose a non-password editable field.'],
   ['input_control_type_unknown','The target control type could not be verified.'],
   ['input_unsupported_control','The target is not a supported editable control.'],
   ['input_target_readonly','The target is read-only.'],
-  ['input_editability_unknown','Windows accessibility could not verify that the target is editable.'],
+  ['input_editability_unknown','Platform accessibility could not verify that the target is editable.'],
   ['input_unsupported_editability','The target does not expose the supported editable-field metadata.'],
   ['input_runtime_id_unavailable','A stable target identity could not be verified.'],
   ['input_focus_changed','The focused target changed during the operation.'],
-  ['input_automation_unavailable','Windows accessibility automation is unavailable.'],
+  ['input_automation_unavailable','Platform accessibility automation is unavailable.'],
   ['input_deadline_exceeded','The native input operation exceeded its time limit.'],
-  ['input_posting_unconfirmed','Windows did not confirm all requested input events.'],
+  ['input_posting_unconfirmed','The platform did not confirm all requested input events.'],
   ['input_busy','Another input operation is still finishing.'],
   ['injection_unconfirmed','Input completion could not be confirmed.'],
   ['unauthorized','The sending phone is not authorized.'],
@@ -101,13 +109,13 @@ const INPUT_DETAILS = new Map([
 ]);
 function inputDiagnostic(result){
   const status=['submitted','rejected','unknown'].includes(result?.status)?result.status:'unknown';
-  if(status==='submitted')return 'Input diagnostic — submitted. Windows accepted the input events; this does not verify that the target app accepted or saved the text. Inspect the target field.';
+  if(status==='submitted')return 'Input diagnostic — submitted. The OS input events were submitted; this does not verify that the target app accepted or saved the text. Inspect the target field.';
   const code=typeof result?.code==='string'&&INPUT_DETAILS.has(result.code)?result.code:'unknown_input_result';
   const detail=INPUT_DETAILS.get(code)||'Unrecognized technical details were withheld to protect private data.';
   const outcome=status==='rejected'?'This attempt was rejected. Inspect the target and resolve the issue before sending again.':'Some or all text may already have been entered. If this request included Enter, it may also have been posted. Inspect the target field and app before any manual retry; Teleport does not automatically resend.';
   return `Input diagnostic — ${status} [${code}]. ${detail} ${outcome}`;
 }
-const STAGES={setup:'Setup command',setup_status:'Status refresh after successful setup',status:'Status refresh',pause:'Change input state',connection:'Change relay connection',pairing:'Create pairing code',approve:'Pairing approval',revoke:'Revoke phone',reset:'Reset room',set_input_mode:'Change input mode',input_mode_status:'Status refresh after input mode change'};
+const STAGES={permissions:'Refresh permissions',request_permission:'Request macOS permission',setup:'Setup command',setup_status:'Status refresh after successful setup',status:'Status refresh',pause:'Change input state',connection:'Change relay connection',pairing:'Create pairing code',approve:'Pairing approval',revoke:'Revoke phone',reset:'Reset room',set_input_mode:'Change input mode',input_mode_status:'Status refresh after input mode change'};
 class UiFailure extends Error{constructor(stage,code){super('Safe UI diagnostic');this.stage=stage;this.code=code;}}
 function safeCode(error){const value=typeof error==='string'?error:error instanceof Error?error.message:typeof error?.code==='string'?error.code:'';return ERROR_DETAILS.has(value)?value:'unknown_error';}
 function diagnostic(error){
@@ -120,16 +128,25 @@ function diagnostic(error){
 
 export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,setTimer=setTimeout,clearTimer=clearTimeout}) {
   const $=id=>document.getElementById(id);
-  let state={configured:false,connected:false,paused:true,devices:[]}, pending=null, qrTimer, pendingTimer, qrVersion=0, statusVersion=0, resetBusy=false, modeBusy=false;
+  let state={configured:false,connected:false,paused:true,devices:[]}, pending=null, qrTimer, pendingTimer, qrVersion=0, statusVersion=0, resetBusy=false, modeBusy=false, permissionBusy=false;
   const busy=new Set(), unlisten=[];
   const notice=text=>{$('notice').textContent=text;};
   async function call(command,args,stage=command){try{return await invoke(command,args);}catch(error){throw new UiFailure(stage,safeCode(error));}}
   function clearQR(){qrVersion++;clearTimer(qrTimer);$('qr').hidden=true;$('pairUrl').value='';const canvas=$('qrCanvas');canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height);}
   function clearPending(){clearTimer(pendingTimer);pending=null;$('approval').hidden=true;$('sas').textContent='';$('phoneName').textContent='';}
   async function action(key,fn){if(busy.has(key))return;busy.add(key);const button=$(key);if(button)button.disabled=true;notice('');try{await fn();}catch(error){notice(diagnostic(error));}finally{busy.delete(key);if(button)button.disabled=false;renderControls();}}
+  const permissionsGranted=()=>state.platform!=='macos'||(state.permissions?.accessibility==='granted'&&state.permissions?.postEvent==='granted');
+  function renderPermissions(){
+    const mac=state.platform==='macos';
+    $('permissions').hidden=!mac;$('platform').textContent=mac?'macOS':state.platform==='windows'?'Windows':'';
+    const label=value=>value==='granted'?'granted':value==='denied'?'not granted':'unknown — refresh required';
+    $('permissionStatus').textContent=`Accessibility: ${label(state.permissions?.accessibility)} · Event posting: ${label(state.permissions?.postEvent)}`;
+    for(const id of ['refreshPermissions','requestAccessibility','requestPostEvent'])$(id).disabled=!mac||permissionBusy;
+  }
   function renderControls(){
+    renderPermissions();
     $('newPair').disabled=!state.connected||busy.has('newPair');
-    $('pause').disabled=!state.connected||busy.has('pause')||modeBusy;
+    $('pause').disabled=!state.connected||busy.has('pause')||modeBusy||(state.paused&&(!permissionsGranted()||permissionBusy));
     $('inputModeToggle').disabled=!state.connected||modeBusy;
     $('confirmInputMode').disabled=!state.connected||modeBusy;
     $('cancelInputMode').disabled=modeBusy;
@@ -141,7 +158,7 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
     $('setup').hidden=!!state.configured;$('receiver').hidden=!state.configured;
     $('computer').textContent=state.name||'';
     $('connection').textContent=`${state.connected?'Relay connected':'Relay offline'} · ${state.paused?'Input paused':'Input enabled'}`;
-    $('target').textContent=state.targetLabel||'Focused editable field (Windows)';
+    $('target').textContent=state.targetLabel||'Focused editable field';
     $('pause').textContent=state.paused?'Resume input':'Pause input';
     const compatibility=state.inputMode==='compatibility';
     $('inputModeStatus').textContent=compatibility?'Compatibility input mode — reduced target checks':'Strict input mode';
@@ -157,7 +174,19 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
   }
   async function refresh(stage='status'){const before=statusVersion;const result=await call('status',undefined,stage);if(before===statusVersion)render(result);}
   $('setupForm').onsubmit=event=>{event.preventDefault();return action('setupSubmit',async()=>{await call('setup',{endpoint:$('endpoint').value.trim(),name:$('name').value.trim()});await refresh('setup_status');});};
-  $('pause').onclick=()=>action('pause',async()=>{await call('pause',{paused:!state.paused});await refresh();});
+  $('pause').onclick=()=>action('pause',async()=>{if(state.paused&&(!permissionsGranted()||permissionBusy))throw new UiFailure('pause','macos_permissions_required');await call('pause',{paused:!state.paused});await refresh();});
+  async function updatePermissions(kind){
+    if(state.platform!=='macos'||permissionBusy)return;
+    permissionBusy=true;state={...state,permissions:{accessibility:'unknown',postEvent:'unknown'}};renderControls();notice('');
+    try{
+      if(kind){await call('request_permission',{kind});await refresh();}
+      else{const version=statusVersion;const permissions=await call('permissions');if(version===statusVersion){state={...state,permissions};statusVersion++;}}
+    }catch(error){notice(diagnostic(error));}
+    finally{permissionBusy=false;renderControls();}
+  }
+  $('refreshPermissions').onclick=()=>updatePermissions();
+  $('requestAccessibility').onclick=()=>updatePermissions('accessibility');
+  $('requestPostEvent').onclick=()=>updatePermissions('postEvent');
   $('connectionToggle').onclick=()=>action('connectionToggle',async()=>{await call('connection',{connected:!!state.disconnected});await refresh();});
   $('newPair').onclick=()=>action('newPair',async()=>{
     clearQR();const version=qrVersion;const pair=await call('pairing');
@@ -210,7 +239,7 @@ export async function mountReceiver({document,invoke,listen,drawQR,now=Date.now,
   document.addEventListener('click',blockLink,true);document.addEventListener('drop',blockDrop);document.addEventListener('dragover',blockDrop);
   unlisten.push(await listen('status',event=>render(event.payload)));
   const knownNotices=new Set(['Message refused or connection error.','Relay refused an operation. Check authorization and connection.']);
-  unlisten.push(await listen('notice',event=>notice(knownNotices.has(event.payload)?event.payload:typeof event.payload==='string'&&INPUT_DETAILS.has(event.payload)&&(event.payload.startsWith('input_')||event.payload==='windows_input_unavailable'||event.payload==='injection_unconfirmed')?inputDiagnostic({status:'unknown',code:event.payload}):safeCode(event.payload)!=='unknown_error'?diagnostic(new UiFailure('connection',safeCode(event.payload))):'Receiver notice. Unrecognized details were withheld to protect private data.')));
+  unlisten.push(await listen('notice',event=>notice(knownNotices.has(event.payload)?event.payload:typeof event.payload==='string'&&INPUT_DETAILS.has(event.payload)&&(event.payload.startsWith('input_')||event.payload==='windows_input_unavailable'||event.payload==='macos_input_unavailable'||event.payload==='injection_unconfirmed')?inputDiagnostic({status:'unknown',code:event.payload}):safeCode(event.payload)!=='unknown_error'?diagnostic(new UiFailure('connection',safeCode(event.payload))):'Receiver notice. Unrecognized details were withheld to protect private data.')));
   unlisten.push(await listen('input-result',event=>notice(inputDiagnostic(event.payload))));
   unlisten.push(await listen('pair-request',event=>{
     if(!state.connected)return;clearPending();clearQR();pending=event.payload;$('phoneName').textContent=pending.name;$('sas').textContent=pending.sas;$('approval').hidden=false;

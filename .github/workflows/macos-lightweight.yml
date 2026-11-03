@@ -1,0 +1,172 @@
+name: Lightweight macOS preview
+on:
+  push:
+    branches: [main]
+    tags: ['v0.3.*']
+    paths:
+      - 'apps/windows-tauri/**'
+      - 'apps/web/**'
+      - 'tests/e2e.test.mjs'
+      - 'packages/protocol/**'
+      - 'scripts/macos-*'
+      - '.github/workflows/macos-lightweight.yml'
+      - '.github/macos-release-request.json'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    paths:
+      - 'apps/windows-tauri/**'
+      - 'apps/web/**'
+      - 'tests/e2e.test.mjs'
+      - 'packages/protocol/**'
+      - 'scripts/macos-*'
+      - '.github/workflows/macos-lightweight.yml'
+      - '.github/macos-release-request.json'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: teleport-macos-lightweight-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: node scripts/macos-release-plan.mjs >> "$GITHUB_OUTPUT"
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm audit --audit-level=high
+      - run: npm run check
+      - run: npm test
+      - run: node --test scripts/macos-ci.test.mjs
+      - run: npm run build -w @teleport/windows-tauri
+  phone:
+    needs: core
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm run build -w @teleport/web
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - name: Phone browser through local Worker and simulated input
+        shell: bash
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          npm run dev -w @teleport/relay -- --ip 127.0.0.1 --port 8787 > /tmp/teleport-relay.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/ >/dev/null
+          npm run test:e2e
+  macos:
+    needs: [plan, core]
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      TELEPORT_VERSION: ${{ needs.plan.outputs.version }}
+      CARGO_TERM_COLOR: always
+      APPLE_SIGNING_IDENTITY: '-'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - name: Verify native Apple silicon runner
+        run: node -e "if(process.platform!=='darwin'||process.arch!=='arm64')throw Error('Native macOS arm64 required')"
+      - name: Rust toolchain and target
+        working-directory: apps/windows-tauri/src-tauri
+        run: rustup show
+      - name: Test native macOS Rust core
+        working-directory: apps/windows-tauri/src-tauri
+        run: cargo test --locked
+      - name: Build lightweight app with system WKWebView
+        run: npm exec --workspace @teleport/windows-tauri -- tauri build --config src-tauri/tauri.macos.conf.json --bundles app
+      - name: Actual ad-hoc app bundle and WKWebView startup
+        run: node scripts/macos-smoke.mjs
+      - name: Archive and measured size manifest
+        run: node scripts/macos-package.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Teleport-macos-lightweight-arm64
+          path: |
+            artifacts/macos-lightweight/*.zip
+            artifacts/macos-lightweight/*.manifest.json
+          if-no-files-found: error
+          retention-days: 3
+  release:
+    needs: [plan, core, macos, phone]
+    if: needs.plan.outputs.release == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: Teleport-macos-lightweight-arm64
+          path: release-assets
+      - name: Immutable macOS-only prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          cd release-assets
+          sha256sum *.zip *.manifest.json > SHA256SUMS.txt
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing replacement.' >&2; exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/tags/* ]] && git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo 'Tag already exists; refusing retarget.' >&2; exit 1
+          fi
+          gh release create "$VERSION" ./*.zip ./*.manifest.json SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Teleport $VERSION — lightweight macOS preview" --notes "macOS arm64 only, source $GITHUB_SHA. Tauri + system WKWebView; no Electron/Node/.NET/browser runtime bundled. Ad-hoc signed, NOT Developer ID signed or notarized; no security-policy bypass. Strict input by default, explicit session-only compatibility mode, optional phone Enter-after-text and safe input diagnostics. Input remains paused until explicit permission checks and Resume. Existing Electron profile and relay URL are not changed; use the same relay URL and explicitly pair the new receiver. CI verifies native build and actual app/WKWebView startup, not real focused-input/permission/password-target acceptance. Windows releases are unchanged. See measured-size manifest and SHA256SUMS.txt."

@@ -23,3 +23,5 @@ apps/windows-tauri/src-tauri/gen/
 apps/windows-tauri/dist/
 
 apps/windows-tauri/src-tauri/icons/icon.ico
+
+apps/windows-tauri/src-tauri/icons/icon.png

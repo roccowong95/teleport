@@ -9,7 +9,10 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 pub type Emit = Arc<dyn Fn(&str, Value) + Send + Sync>;
+#[cfg(not(target_os="macos"))]
 const TARGET: &str = "Windows focused editable field — no clipboard";
+#[cfg(target_os="macos")]
+const TARGET: &str = "macOS focused editable field — no clipboard";
 const MAX_FRAME: usize = 28_000;
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -112,7 +115,7 @@ struct Command { name: String, args: Value, epoch: u64, reply: oneshot::Sender<R
 
 impl Handle {
     pub async fn call(&self, cmd: &str, args: Value) -> Result<Value, String> {
-        if matches!(cmd,"disconnect"|"stop"|"revoke"|"reset"|"set_input_mode") || (cmd=="pause" && args["paused"]==true) { self.safety.cancel(); }
+        if matches!(cmd,"disconnect"|"stop"|"revoke"|"reset"|"set_input_mode"|"request_permission") || (cmd=="pause" && args["paused"]==true) { self.safety.cancel(); }
         let epoch=self.safety.epoch.load(Ordering::SeqCst);
         let (reply, answer) = oneshot::channel();
         self.commands.send(Command {name: cmd.into(), args, epoch, reply}).await.map_err(|_| "controller_stopped")?;
@@ -129,7 +132,7 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
     let (commands, rx) = mpsc::channel(32);
     let (events, event_rx) = mpsc::channel(32);
     let safety=Arc::new(Safety::new());
-    let actor = Actor {safety:safety.clone(),path, emit, state, http, commands: rx, events, event_rx,
+    let actor = Actor {permission_ready:input::permissions_granted,safety:safety.clone(),path, emit, state, http, commands: rx, events, event_rx,
         transport: None, outbound: None, generation: 0, connected: false, stopped: false,
         paused: true, retry: None, attempts: 0, session: Uuid::new_v4().to_string(),
         pending: HashMap::new(), online: HashSet::new(), gate: Gate::default(), injecting: false, input_mode:input::InputMode::Strict};
@@ -140,6 +143,7 @@ pub fn start(path: PathBuf, emit: Emit) -> Result<Handle, String> {
 struct Pending { public_key: String, name: String, expires: u64, confirmed: bool }
 enum Event { Frame(u64, Value), Closed(u64, Option<String>), Injected { generation: u64, device_id: String, message_id: String, result: Result<(),input::InputFailure>, token: Arc<AtomicBool> } }
 struct Actor {
+    permission_ready: fn() -> bool,
     safety: Arc<Safety>,
     path: PathBuf, emit: Emit, state: Option<Value>, http: reqwest::Client,
     commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>, event_rx: mpsc::Receiver<Event>,
@@ -200,7 +204,7 @@ impl Actor {
     }
     fn status(&self) -> Value {
         let devices = self.state.as_ref().and_then(|s| s["peers"].as_object()).map(|peers| peers.iter().map(|(id,p)| json!({"deviceId":id,"name":p["name"],"online":self.online.contains(id)})).collect::<Vec<_>>()).unwrap_or_default();
-        json!({"configured":self.state.is_some(),"disconnected":self.stopped,"connected":self.connected,
+        json!({"platform":if cfg!(target_os="macos"){"macos"}else{"windows"},"permissions":input::permissions(),"configured":self.state.is_some(),"disconnected":self.stopped,"connected":self.connected,
             "paused":self.paused || self.safety.emergency.load(Ordering::SeqCst),"name":self.state.as_ref().map(|s| &s["name"]),
             "endpoint":self.state.as_ref().map(|s| &s["endpoint"]),"targetLabel":TARGET,"devices":devices,
             "inputMode":match self.input_mode {input::InputMode::Strict=>"strict",input::InputMode::Compatibility=>"compatibility"}})
@@ -280,6 +284,7 @@ impl Actor {
     async fn command_at(&mut self, command: &str, args: Value, epoch:u64) -> Result<Value,String> {
         match command {
             "status" => return Ok(self.status()),
+            "permissions" => return Ok(input::permissions()),
             "setup" => {
                 if self.state.is_some() { return Err("already_configured".into()); }
                 let endpoint = normalize_endpoint(string(&args,"endpoint")?)?;
@@ -300,6 +305,7 @@ impl Actor {
             "disconnect" | "stop" => self.stop(),
             "pause" => {
                 let paused = args["paused"].as_bool().ok_or("invalid_paused")?;
+                if !paused && !(self.permission_ready)() { self.safety.cancel(); self.paused=true; for id in &self.online { let _=self.ready(id); } self.changed(); return Err("macos_permissions_required".into()); }
                 if !paused && !self.connected { return Err("relay_offline".into()); }
                 if paused { self.safety.cancel(); }
                 else { if self.injecting { return Err("input_busy".into()); } self.safety.resume(epoch)?; }
@@ -570,6 +576,12 @@ mod tests {
         assert_eq!(normalize_endpoint("http://localhost:8787/").unwrap(),"http://localhost:8787");
         for value in ["http://example.com","https://a.test/path","https://user:pass@a.test","https://a.test/#secret","https://a.test/?token=secret"] { assert!(normalize_endpoint(value).is_err()); }
     }
+    #[tokio::test] async fn resume_without_permissions_remains_paused_and_does_not_resume_safety() {
+        let (mut actor,_,_,_)=actor_fixture(); actor.permission_ready=||false;
+        assert_eq!(actor.command("pause",json!({"paused":false})).await.unwrap_err(),"macos_permissions_required");
+        assert!(actor.paused); assert!(actor.safety.emergency.load(Ordering::SeqCst));
+        actor.command("pause",json!({"paused":true})).await.unwrap();
+    }
     #[test] fn paused_or_revoked_messages_never_consume_the_gate() {
         let mut gate = Gate::default(); let message = text();
         assert_eq!(gate.accept(&message,"session",1000,true,true),Err("paused"));
@@ -596,7 +608,7 @@ mod tests {
         state["peers"][&device_id]=json!({"name":"Phone","publicKey":phone["publicKey"]});
         let (_,commands)=mpsc::channel(4); let (events,event_rx)=mpsc::channel(4); let (tx,rx)=mpsc::channel(16);
         let path=std::env::temp_dir().join(format!("teleport-controller-test-{}",Uuid::new_v4())).join("identity.dpapi");
-        let actor=Actor {safety:Arc::new(Safety::new()),path,emit:Arc::new(|_,_|{}),state:Some(state),http:reqwest::Client::new(),commands,events,event_rx,
+        let actor=Actor {permission_ready:||true,safety:Arc::new(Safety::new()),path,emit:Arc::new(|_,_|{}),state:Some(state),http:reqwest::Client::new(),commands,events,event_rx,
             transport:None,outbound:Some(tx),generation:1,connected:true,stopped:false,paused:true,retry:None,attempts:0,
             session:Uuid::new_v4().to_string(),pending:HashMap::new(),online:HashSet::from([device_id.clone()]),gate:Gate::default(),injecting:false,input_mode:input::InputMode::Strict};
         (actor,rx,phone,device_id)
@@ -631,12 +643,13 @@ mod tests {
     }
     #[tokio::test] async fn actor_revocation_removes_authorization_even_if_storage_fails() {
         let (mut actor,_,phone,id)=actor_fixture(); let message=phone_message(&actor,&phone,&id); let path=actor.path.clone();
+        // Deterministic filesystem failure, before any platform credential API.
+        std::fs::write(path.parent().unwrap(),b"blocked test directory").unwrap();
         let result=actor.receive(json!({"type":"peer-revoked","deviceId":id})).await;
-        #[cfg(windows)] assert!(result.is_ok());
-        #[cfg(not(windows))] assert!(result.is_err());
+        assert!(result.is_err());
         assert!(!actor.online.contains(&id)); assert!(actor.state().unwrap()["peers"].get(&id).is_none());
         assert!(actor.receive_text(&message).await.is_err()); assert!(!actor.injecting);
-        let _=std::fs::remove_dir_all(path.parent().unwrap());
+        let _=std::fs::remove_file(path.parent().unwrap());
     }
     #[tokio::test] async fn changed_key_and_unconfirmed_approval_cannot_authorize() {
         let (mut actor,_,phone,id)=actor_fixture(); actor.state.as_mut().unwrap()["peers"].as_object_mut().unwrap().remove(&id); actor.online.clear();
@@ -659,12 +672,13 @@ mod tests {
         actor.disconnected(); assert_eq!(actor.state().unwrap()["peers"][&id]["publicKey"],phone["publicKey"]);
         let _=std::fs::remove_dir_all(actor.path.parent().unwrap());
     }
-    #[cfg(not(windows))]
     #[tokio::test] async fn unavailable_secure_storage_prevents_approval() {
         let (mut actor,mut output,phone,id)=actor_fixture(); actor.state.as_mut().unwrap()["peers"].as_object_mut().unwrap().remove(&id); actor.online.clear();
         actor.receive(json!({"type":"pair-request","deviceId":id,"publicKey":phone["publicKey"],"name":"Phone"})).await.unwrap();
+        std::fs::write(actor.path.parent().unwrap(),b"blocked test directory").unwrap();
         assert!(actor.command("approve",json!({"deviceId":id,"confirmed":true})).await.is_err());
         assert!(output.try_recv().is_err()); assert!(actor.state().unwrap()["peers"].get(&id).is_none());
+        std::fs::remove_file(actor.path.parent().unwrap()).unwrap();
     }
 
     #[tokio::test] async fn emergency_handle_cancels_native_before_a_full_command_queue_can_progress() {
