@@ -32,3 +32,5 @@ test('macOS native staging and smoke refuse other hosts',()=>{
 });
 
 test('macOS generate_context has a generated RGBA PNG before Tauri build',()=>{const build=readFileSync('apps/windows-tauri/src-tauri/build.rs','utf8');const config=JSON.parse(readFileSync('apps/windows-tauri/src-tauri/tauri.macos.conf.json','utf8'));assert.ok(config.bundle.icon.includes('icons/icon.png'));assert.ok(build.indexOf('icons/icon.png')<build.indexOf('tauri_build::build()'));assert.match(build,/137u8,80,78,71,13,10,26,10/);});
+
+test('macOS support floor includes native dialog confirmation support',()=>{const config=JSON.parse(readFileSync('apps/windows-tauri/src-tauri/tauri.macos.conf.json','utf8'));assert.equal(config.bundle.macOS.minimumSystemVersion,'13.0');assert.match(readFileSync('apps/windows-tauri/vite.config.js','utf8'),/safari16/);});

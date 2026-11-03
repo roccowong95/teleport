@@ -1,6 +1,6 @@
 # Lightweight macOS preview (Tauri)
 
-The macOS arm64 receiver uses Rust and macOS's system WKWebView instead of bundling Electron/Node.js. It shares the Windows lightweight protocol/controller/UI while keeping separate native input and Keychain-backed credential storage. Windows DPAPI and input behavior remain Windows-specific. No browser engine, Node.js, .NET or Electron runtime ships in this app. Actual archive/expanded sizes are recorded by CI, not estimated; the OS's own frameworks are excluded from those sizes.
+The macOS 13+ arm64 receiver uses Rust and macOS's system WKWebView instead of bundling Electron/Node.js. It shares the Windows lightweight protocol/controller/UI while keeping separate native input and Keychain-backed credential storage. Windows DPAPI and input behavior remain Windows-specific. No browser engine, Node.js, .NET or Electron runtime ships in this app. Actual archive/expanded sizes are recorded by CI, not estimated; the OS's own frameworks are excluded from those sizes.
 
 ## Profile and safety boundaries
 
@@ -10,7 +10,7 @@ Input starts paused, strict input is the default, and permission status checks d
 
 ## Build and CI
 
-Use native macOS arm64, the pinned Rust toolchain, Node 24 and Apple command-line tools. Node is build-time only. No host security changes or toolchain-selection changes are performed.
+Use native macOS 13+ arm64, the pinned Rust toolchain, Node 24 and Apple command-line tools. Node is build-time only. No host security changes or toolchain-selection changes are performed.
 
 ```sh
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci
@@ -39,3 +39,5 @@ The request must change in that push; unrelated pushes and pull requests cannot 
 Download the candidate artifact and verify its checksums. Use an isolated test profile and a dedicated harmless editor, never existing user documents. Record OS, architecture and target application. Confirm: startup and tray reopen; permission status and canceled permission prompts remain fail-closed; explicit authorization and Resume; pair/SAS approval; Chinese, emoji, multiline and selection replacement; pause/disconnect/revoke while sending; strict rejection of unsupported/password/unknown targets; focus changes and held modifiers; explicit compatibility enable/cancel/reconnect reset; optional Enter off/on, only after successful text; and clear rejected versus unknown diagnostics on desktop/phone. Existing relay URL/profile must remain untouched. Already posted OS events cannot be recalled, and submission does not prove application acceptance or saving.
 
 Known native acceptance limit: missing, empty or `AXUnknown` subroles are refused in both input modes because non-password status is not established. Some ordinary or custom editor widgets may therefore be refused. CI does not prove TextEdit/browser compatibility; verify harmless fields before relying on this preview.
+
+The minimum macOS version is 13.0 (Safari 16 generation); the Mac frontend is built for Safari 16. Earlier system WebKit versions do not consistently support the native dialog controls used for explicit compatibility/reset confirmations.
