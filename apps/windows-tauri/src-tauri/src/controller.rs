@@ -643,12 +643,13 @@ mod tests {
     }
     #[tokio::test] async fn actor_revocation_removes_authorization_even_if_storage_fails() {
         let (mut actor,_,phone,id)=actor_fixture(); let message=phone_message(&actor,&phone,&id); let path=actor.path.clone();
+        // Deterministic filesystem failure, before any platform credential API.
+        std::fs::write(path.parent().unwrap(),b"blocked test directory").unwrap();
         let result=actor.receive(json!({"type":"peer-revoked","deviceId":id})).await;
-        #[cfg(windows)] assert!(result.is_ok());
-        #[cfg(not(windows))] assert!(result.is_err());
+        assert!(result.is_err());
         assert!(!actor.online.contains(&id)); assert!(actor.state().unwrap()["peers"].get(&id).is_none());
         assert!(actor.receive_text(&message).await.is_err()); assert!(!actor.injecting);
-        let _=std::fs::remove_dir_all(path.parent().unwrap());
+        let _=std::fs::remove_file(path.parent().unwrap());
     }
     #[tokio::test] async fn changed_key_and_unconfirmed_approval_cannot_authorize() {
         let (mut actor,_,phone,id)=actor_fixture(); actor.state.as_mut().unwrap()["peers"].as_object_mut().unwrap().remove(&id); actor.online.clear();
@@ -671,12 +672,13 @@ mod tests {
         actor.disconnected(); assert_eq!(actor.state().unwrap()["peers"][&id]["publicKey"],phone["publicKey"]);
         let _=std::fs::remove_dir_all(actor.path.parent().unwrap());
     }
-    #[cfg(not(windows))]
     #[tokio::test] async fn unavailable_secure_storage_prevents_approval() {
         let (mut actor,mut output,phone,id)=actor_fixture(); actor.state.as_mut().unwrap()["peers"].as_object_mut().unwrap().remove(&id); actor.online.clear();
         actor.receive(json!({"type":"pair-request","deviceId":id,"publicKey":phone["publicKey"],"name":"Phone"})).await.unwrap();
+        std::fs::write(actor.path.parent().unwrap(),b"blocked test directory").unwrap();
         assert!(actor.command("approve",json!({"deviceId":id,"confirmed":true})).await.is_err());
         assert!(output.try_recv().is_err()); assert!(actor.state().unwrap()["peers"].get(&id).is_none());
+        std::fs::remove_file(actor.path.parent().unwrap()).unwrap();
     }
 
     #[tokio::test] async fn emergency_handle_cancels_native_before_a_full_command_queue_can_progress() {
