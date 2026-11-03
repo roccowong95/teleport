@@ -5,6 +5,15 @@ use tauri::{Emitter,Manager,State,WebviewWindow};
 struct Backend { handle: Handle, smoke: Option<PathBuf> }
 fn local(window:&WebviewWindow)->Result<(),String>{if window.label()!="main" {return Err("untrusted_window".into())} let url=window.url().map_err(|_|"window_unavailable")?;if !((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost"))||(cfg!(debug_assertions)&&url.host_str()==Some("localhost")&&url.port()==Some(1420))){return Err("untrusted_origin".into())}Ok(())}
 #[tauri::command] async fn status(window:WebviewWindow,state:State<'_,Backend>)->Result<Value,String>{local(&window)?;state.handle.call("status",json!({})).await}
+#[tauri::command] async fn permissions(window:WebviewWindow,state:State<'_,Backend>)->Result<Value,String>{local(&window)?;state.handle.call("permissions",json!({})).await}
+#[tauri::command] async fn request_permission(window:WebviewWindow,app:tauri::AppHandle,state:State<'_,Backend>,kind:String)->Result<Value,String>{
+ local(&window)?;
+ if !matches!(kind.as_str(),"accessibility"|"postEvent"){return Err("invalid_permission_kind".into())}
+ state.handle.call("pause",json!({"paused":true})).await?;
+ let (send,receive)=tokio::sync::oneshot::channel();
+ app.run_on_main_thread(move||{let _=send.send(crate::input::request_permission(&kind));}).map_err(|_|"permission_request_failed")?;
+ receive.await.map_err(|_|"permission_request_failed")?
+}
 #[tauri::command] async fn setup(window:WebviewWindow,state:State<'_,Backend>,endpoint:String,name:String)->Result<Value,String>{local(&window)?;state.handle.call("setup",json!({"endpoint":endpoint,"name":name})).await}
 #[tauri::command] async fn pairing(window:WebviewWindow,state:State<'_,Backend>)->Result<Value,String>{local(&window)?;state.handle.call("pairing",json!({})).await}
 #[tauri::command] async fn approve(window:WebviewWindow,state:State<'_,Backend>,device_id:String,confirmed:bool)->Result<Value,String>{local(&window)?;state.handle.call("approve",json!({"deviceId":device_id,"confirmed":confirmed})).await}
@@ -21,11 +30,15 @@ pub fn run(){
   let smoke=std::env::var_os("TELEPORT_CI_SMOKE_DIR").map(PathBuf::from);if smoke.as_ref().is_some_and(|p|!p.is_absolute()){return Err("smoke path must be absolute".into())}
   let dir=match &smoke{Some(p)=>p.clone(),None=>app.path().app_local_data_dir()?};std::fs::create_dir_all(&dir)?;
   let ah=app.handle().clone();let emit=Arc::new(move|event:&str,value:Value|{let _=ah.emit(event,value);});
-  let handle=tauri::async_runtime::block_on(async {controller::start(dir.join("identity.dpapi"),emit)}) .map_err(std::io::Error::other)?;
+  let handle=tauri::async_runtime::block_on(async {controller::start(dir.join(if cfg!(target_os="macos"){"identity.keychain.enc"}else{"identity.dpapi"}),emit)}) .map_err(std::io::Error::other)?;
+  let smoke_mode=smoke.is_some();
   app.manage(Backend{handle:handle.clone(),smoke});
-  tauri::WebviewWindowBuilder::from_config(app,&app.config().app.windows[0])?
+  let window=tauri::WebviewWindowBuilder::from_config(app,&app.config().app.windows[0])?
    .on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost")) || (url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")) || (cfg!(debug_assertions)&&url.host_str()==Some("localhost")&&url.port()==Some(1420)))
-   .on_new_window(|_,_|tauri::webview::NewWindowResponse::Deny).build()?;
+   .on_new_window(|_,_|tauri::webview::NewWindowResponse::Deny);
+  #[cfg(target_os="macos")] let window=window.data_directory(dir.join("webview")).incognito(smoke_mode);
+  #[cfg(not(target_os="macos"))] let _=smoke_mode;
+  window.build()?;
   use tauri::menu::{Menu,MenuItem};
   let open=MenuItem::with_id(app,"open","Open Teleport",true,None::<&str>)?;
   let pause=MenuItem::with_id(app,"pause","Pause input",true,None::<&str>)?;
@@ -36,7 +49,7 @@ pub fn run(){
   Ok(())
  })
  .on_window_event(|window,event|{if let tauri::WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide();}})
- .invoke_handler(tauri::generate_handler![status,setup,pairing,approve,connection,pause,set_input_mode,revoke,reset,smoke_ready])
+ .invoke_handler(tauri::generate_handler![status,permissions,request_permission,setup,pairing,approve,connection,pause,set_input_mode,revoke,reset,smoke_ready])
  .build(tauri::generate_context!()).expect("Teleport could not initialize secure local state");
  app.run(|_,_|{});
 }

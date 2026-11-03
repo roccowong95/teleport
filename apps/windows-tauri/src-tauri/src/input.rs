@@ -1,4 +1,4 @@
-//! Narrow, fail-closed Windows text insertion. No clipboard, elevation, UIAccess,
+//! Narrow, fail-closed native text insertion. No clipboard, elevation, UIAccess,
 //! target-text reads, implicit Return, or automatic retry. Optional Enter is explicit. Success means events
 //! were posted, never that the target application saved/accepted them.
 
@@ -7,7 +7,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 /// Only these static codes may cross the native/controller/UI boundary.
 pub const INPUT_FAILURE_CODES: &[&str] = &[
     "input_size_refused", "input_control_refused", "input_cancelled",
-    "windows_input_unavailable", "input_busy", "input_worker_failed", "input_worker_unavailable",
+    "windows_input_unavailable", "input_permission_required", "input_busy", "input_worker_failed", "input_worker_unavailable",
     "input_deadline_exceeded", "input_posting_unconfirmed", "input_desktop_unavailable",
     "input_modifier_held", "input_foreground_unavailable", "input_integrity_unknown", "input_target_elevated",
     "input_focus_unavailable", "input_focus_pid_mismatch", "input_enabled_unknown", "input_target_disabled",
@@ -20,7 +20,7 @@ pub const INPUT_FAILURE_CODES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputFailure {
     pub code: &'static str,
-    /// True as soon as SendInput is attempted, including zero/partial event counts.
+    /// True as soon as OS posting is attempted, including zero/partial event counts.
     /// Once true, later cancellation/guard failure/panic must remain unknown.
     pub may_have_posted: bool,
 }
@@ -28,7 +28,7 @@ fn failure(code: &'static str) -> InputFailure {
     debug_assert!(INPUT_FAILURE_CODES.contains(&code));
     InputFailure { code, may_have_posted: false }
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn with_posting_progress(mut error: InputFailure, posting: &AtomicBool) -> InputFailure {
     error.may_have_posted |= posting.load(Ordering::Acquire);
     error
@@ -97,7 +97,7 @@ pub fn inject(text: &str) -> Result<(), InputFailure> {
     inject_cancellable(text, Arc::new(AtomicBool::new(false)))
 }
 
-/// Cancellation stops future chunks; it cannot retract events already queued by Windows.
+/// Cancellation stops future chunks; it cannot retract events already queued by the OS.
 /// Use a fresh token per injection. Never clear/reuse a cancelled token.
 pub fn inject_cancellable(text: &str, cancel: Arc<AtomicBool>) -> Result<(), InputFailure> {
     inject_cancellable_with_mode(text, cancel, InputMode::Strict, false)
@@ -109,7 +109,9 @@ pub fn inject_cancellable_with_mode(text: &str, cancel: Arc<AtomicBool>, mode: I
     validate_text(text)?;
     #[cfg(windows)]
     { native::inject(text, cancel, mode, press_enter) }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    { mac::inject(text, cancel, mode, press_enter) }
+    #[cfg(not(any(windows, target_os = "macos")))]
     { let _ = (text, mode, press_enter); Err(failure("windows_input_unavailable")) }
 }
 
@@ -126,6 +128,64 @@ fn finish_with_optional_enter(
     recheck()?;
     ensure_active(cancel)?;
     post_enter()
+}
+
+/// Read-only. Startup, reconnect and resume must never invoke request_permission.
+pub fn permissions() -> serde_json::Value {
+    #[cfg(target_os = "macos")] {
+        let bits = unsafe { mac::teleport_mac_permissions() };
+        serde_json::json!({"applicable":true, "accessibility":if bits & 1 != 0 {"granted"} else {"denied"}, "postEvent":if bits & 2 != 0 {"granted"} else {"denied"}})
+    }
+    #[cfg(not(target_os = "macos"))] {
+        serde_json::json!({"applicable":false, "accessibility":"not_required", "postEvent":"not_required"})
+    }
+}
+pub fn permissions_granted() -> bool {
+    #[cfg(target_os = "macos")] { unsafe { mac::teleport_mac_permissions() == 3 } }
+    #[cfg(not(target_os = "macos"))] { true }
+}
+/// Call only for an explicit user request. A prompt return is NOT a permission grant.
+pub fn request_permission(kind: &str) -> Result<serde_json::Value, String> {
+    let permission = match kind { "accessibility" => 1, "postEvent" => 2, _ => return Err("invalid_permission_request".into()) };
+    #[cfg(target_os = "macos")] { unsafe { mac::teleport_mac_request_permission(permission) }; Ok(permissions()) }
+    #[cfg(not(target_os = "macos"))] { let _ = permission; Err("permission_request_unsupported".into()) }
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::*;
+    use std::ffi::{c_char, c_void, CStr};
+    unsafe extern "C" {
+        pub(super) fn teleport_mac_permissions() -> u32;
+        pub(super) fn teleport_mac_request_permission(permission: u32);
+        fn teleport_mac_inject(bytes: *const u8, count: usize, compatibility: bool, enter: bool,
+            cancelled: extern "C" fn(*const c_void) -> bool,
+            posting: extern "C" fn(*const c_void), context: *const c_void) -> *const c_char;
+    }
+    struct Context { cancel: Arc<AtomicBool>, posting: AtomicBool }
+    extern "C" fn cancelled(context: *const c_void) -> bool {
+        // Synchronous C call borrows Context; never retained by Objective-C.
+        unsafe { &*context.cast::<Context>() }.cancel.load(Ordering::Acquire)
+    }
+    extern "C" fn posting(context: *const c_void) {
+        unsafe { &*context.cast::<Context>() }.posting.store(true, Ordering::Release);
+    }
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    struct BusyGuard;
+    impl Drop for BusyGuard { fn drop(&mut self) { BUSY.store(false, Ordering::Release); } }
+    pub(super) fn inject(text: &str, cancel: Arc<AtomicBool>, mode: InputMode, enter: bool) -> Result<(), InputFailure> {
+        ensure_active(&cancel)?;
+        if BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { return Err(failure("input_busy")); }
+        let _busy = BusyGuard;
+        let context = Context { cancel, posting: AtomicBool::new(false) };
+        // Controller already dispatches this blocking operation off the main event loop.
+        let error = unsafe { teleport_mac_inject(text.as_ptr(), text.len(), mode == InputMode::Compatibility,
+            enter, cancelled, posting, (&context as *const Context).cast()) };
+        if error.is_null() { return Ok(()); }
+        let native_code = unsafe { CStr::from_ptr(error) }.to_str().unwrap_or("");
+        let code = INPUT_FAILURE_CODES.iter().copied().find(|code| *code == native_code).unwrap_or("input_worker_failed");
+        Err(with_posting_progress(failure(code), &context.posting))
+    }
 }
 
 #[cfg(windows)]
@@ -353,6 +413,17 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn invalid_permission_request_never_reaches_native_api() {
+        for kind in ["", "all", "Accessibility", "post_event"] {
+            assert_eq!(request_permission(kind), Err("invalid_permission_request".into()));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[test] fn other_platforms_do_not_request_mac_permissions() {
+        assert_eq!(permissions()["applicable"], false);
+        assert!(permissions_granted());
+        assert_eq!(request_permission("accessibility"), Err("permission_request_unsupported".into()));
+    }
     #[test] fn enter_is_off_by_default_and_only_follows_successful_recheck() {
         let cancel = AtomicBool::new(false);
         assert!(finish_with_optional_enter(false, &cancel, || panic!("disabled"), || panic!("disabled")).is_ok());
@@ -444,6 +515,6 @@ mod tests {
         use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
         assert_eq!(std::mem::size_of::<INPUT>(), if std::mem::size_of::<usize>() == 8 { 40 } else { 28 });
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test] fn non_windows_refuses_input() { assert_eq!(inject("harmless"), Err(failure("windows_input_unavailable"))); }
 }

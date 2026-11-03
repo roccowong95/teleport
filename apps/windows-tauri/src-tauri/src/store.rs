@@ -1,8 +1,9 @@
-//! Current-user Windows DPAPI storage. Never stores a plaintext fallback and never prompts.
+//! Current-user Windows DPAPI / macOS Keychain-backed storage. No plaintext fallback.
 use serde_json::Value;
 use std::{fs, path::Path};
 #[cfg(windows)] use std::{io::Write, path::PathBuf};
 #[cfg(windows)] use zeroize::Zeroizing;
+#[cfg(not(target_os="macos"))]
 const MAGIC: &[u8] = b"TELEPORT-DPAPI-V1\0";
 const MAX_BYTES: u64 = 1_048_576;
 
@@ -41,6 +42,16 @@ const MAX_BYTES: u64 = 1_048_576;
     }
 }
 
+#[cfg(target_os="macos")]
+#[path="store_macos.rs"]
+mod mac;
+
+#[cfg(target_os="macos")]
+pub fn load(path:&Path)->Result<Option<Value>,String>{mac::load(path)}
+#[cfg(target_os="macos")]
+pub fn save(path:&Path,value:&Value)->Result<(),String>{mac::save(path,value)}
+
+#[cfg(not(target_os="macos"))]
 pub fn load(path:&Path)->Result<Option<Value>,String>{
     let meta=match fs::metadata(path){Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(_)=>return Err("secure_store_read_failed".into())};
     if !meta.is_file() || meta.len()>MAX_BYTES || meta.len()<MAGIC.len() as u64{return Err("invalid_secure_store".into());}
@@ -53,6 +64,7 @@ pub fn load(path:&Path)->Result<Option<Value>,String>{
     }
     #[cfg(not(windows))] {Err("windows_secure_storage_required".into())}
 }
+#[cfg(not(target_os="macos"))]
 pub fn save(path:&Path,value:&Value)->Result<(),String>{
     #[cfg(not(windows))] {let _=(path,value);Err("windows_secure_storage_required".into())}
     #[cfg(windows)] {
@@ -79,7 +91,7 @@ pub fn clear(path:&Path)->Result<(),String>{
     #[test] fn refuses_plaintext_store(){
         let dir=std::env::temp_dir().join(format!("teleport-store-test-{}",crate::protocol::random_token()));fs::create_dir_all(&dir).unwrap();let path=dir.join("identity.enc");fs::write(&path,b"{\"secretKey\":\"TEST-ONLY-NOT-A-REAL-SECRET\"}").unwrap();assert!(load(&path).is_err());fs::remove_dir_all(dir).unwrap();
     }
-    #[cfg(not(windows))] #[test] fn nonwindows_has_no_plaintext_fallback(){
+    #[cfg(not(any(windows,target_os="macos")))] #[test] fn unsupported_platform_has_no_plaintext_fallback(){
         let path=std::env::temp_dir().join(format!("teleport-unavailable-{}",crate::protocol::random_token()));assert!(save(&path,&serde_json::json!({"test":"only"})).is_err());assert!(!path.exists());
     }
     #[cfg(windows)] #[test] fn windows_dpapi_roundtrip_and_atomic_replace(){
